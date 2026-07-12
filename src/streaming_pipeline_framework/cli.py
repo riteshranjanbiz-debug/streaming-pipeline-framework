@@ -1,0 +1,63 @@
+"""Reusable CLI plumbing for a pipeline built on this framework.
+
+A downstream project defines its own DomainSpecs and calls `main()` with
+them — see examples/retail_orders/pipeline.py for a full example.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+
+from .framework import DomainSpec, PipelineOptions, StandardOptions, build_streaming_pipeline
+
+
+def build_arg_parser(description: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--project", required=True, help="GCP project ID")
+    parser.add_argument("--region", default="us-central1")
+    parser.add_argument(
+        "--runner", default="DirectRunner", choices=["DirectRunner", "DataflowRunner"]
+    )
+    parser.add_argument(
+        "--temp-location", default=None, help="GCS path for Dataflow temp, e.g. gs://bucket/tmp"
+    )
+    parser.add_argument(
+        "--service-account-email", default=None, help="Dataflow SA email (DataflowRunner only)"
+    )
+    return parser
+
+
+def main(
+    domains: list[DomainSpec],
+    alerts_table: str | None = None,
+    *,
+    description: str = "Streaming pipeline",
+    window_secs: int = 300,
+    pipeline_version: str = "1.0",
+) -> None:
+    """Parse standard CLI args and run `build_streaming_pipeline`."""
+    parser = build_arg_parser(description)
+    args, beam_args = parser.parse_known_args()
+
+    options = PipelineOptions(
+        beam_args,
+        project=args.project,
+        region=args.region,
+        runner=args.runner,
+        streaming=True,
+        save_main_session=True,
+        temp_location=args.temp_location,
+        service_account_email=args.service_account_email,
+    )
+    options.view_as(StandardOptions).streaming = True
+
+    logging.basicConfig(level=logging.INFO)
+    build_streaming_pipeline(
+        args.project,
+        domains,
+        alerts_table,
+        options,
+        window_secs=window_secs,
+        pipeline_version=pipeline_version,
+    )
