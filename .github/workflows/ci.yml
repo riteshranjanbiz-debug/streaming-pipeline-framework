@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-core:
+    name: Tests (no apache-beam)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: pip install -e ".[dev]"
+      - run: python -c "import streaming_pipeline_framework as f; assert f.framework.BEAM_AVAILABLE is False"
+      - run: pytest -v
+
+  test-with-beam:
+    name: Tests (real apache-beam installed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # apache-beam's legacy setup.py needs pkg_resources, which recent
+      # setuptools dropped; build with an older setuptools, no isolation.
+      - run: pip install "setuptools<81" wheel
+      - run: pip install --no-build-isolation -e ".[dev,gcp]"
+      - run: python -c "import streaming_pipeline_framework as f; assert f.framework.BEAM_AVAILABLE is True"
+      - run: pytest -v
+      - run: python -c "from examples.retail_orders.pipeline import AggregateOrderWindow; AggregateOrderWindow()"
