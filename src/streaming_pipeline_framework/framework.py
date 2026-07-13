@@ -101,6 +101,13 @@ class DomainSpec:
 
     Alerting (optional, only meaningful alongside aggregation):
       alert_evaluator      windowed-aggregate dict -> list[alert dict]
+
+    Dead-letter persistence (optional):
+      dlq_table             "dataset.table" — if set, events that fail
+                            parsing or validation are written here (instead
+                            of silently discarded) with an `_error` field.
+                            Needed if you want to monitor DLQ volume as a
+                            pipeline-health signal — see `health.py`.
     """
 
     name: str
@@ -112,6 +119,7 @@ class DomainSpec:
     key_fn: Optional[Callable[[dict], Any]] = None
     aggregate_fn: Optional[Callable[[], Any]] = None
     alert_evaluator: Optional[Callable[[dict], list[dict]]] = None
+    dlq_table: Optional[str] = None
 
     def __post_init__(self):
         has_agg = (self.enriched_table, self.key_fn, self.aggregate_fn)
@@ -132,6 +140,20 @@ class DomainSpec:
 # Generic transforms
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _dlq(error: str, event: Optional[dict] = None, **extra: Any) -> dict[str, Any]:
+    """Builds a DLQ row with a consistent shape — every DLQ row (from any
+    stage) has `_error` and `ingested_at`, so a single dlq_table can be
+    queried uniformly (see health.check_dlq_thresholds). `event` is spread
+    in as a plain dict (not **kwargs) so an event field literally named
+    `error` can never collide with this function's own `error` parameter."""
+    return {
+        **(event or {}),
+        **extra,
+        "_error": error,
+        "ingested_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 class ParseMessage(beam.DoFn):
     """Deserialize Pub/Sub bytes → dict. Malformed JSON goes to the 'dlq' tag."""
 
@@ -139,11 +161,7 @@ class ParseMessage(beam.DoFn):
         try:
             yield json.loads(message.data.decode("utf-8"))
         except Exception as e:
-            yield beam.pvalue.TaggedOutput("dlq", {
-                "raw": str(message.data[:500]),
-                "error": str(e),
-                "ingested_at": datetime.now(timezone.utc).isoformat(),
-            })
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(str(e), raw=str(message.data[:500])))
 
 
 class ValidateEvent(beam.DoFn):
@@ -169,25 +187,20 @@ class ValidateEvent(beam.DoFn):
     def process(self, event, *args, **kwargs):
         missing = self.envelope_required - event.keys()
         if missing:
-            yield beam.pvalue.TaggedOutput("dlq", {
-                **event, "_error": f"missing envelope fields: {missing}"
-            })
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(f"missing envelope fields: {missing}", event))
             return
 
         event_domain = event.get("domain")
         if event_domain is not None and event_domain != self.domain:
-            yield beam.pvalue.TaggedOutput("dlq", {
-                **event,
-                "_error": f"domain mismatch: expected {self.domain!r}, got {event_domain!r}",
-            })
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(
+                f"domain mismatch: expected {self.domain!r}, got {event_domain!r}", event
+            ))
             return
 
         payload = event.get("payload") or {}
         payload_missing = self.payload_required - payload.keys()
         if payload_missing:
-            yield beam.pvalue.TaggedOutput("dlq", {
-                **event, "_error": f"missing payload fields: {payload_missing}"
-            })
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(f"missing payload fields: {payload_missing}", event))
             return
 
         yield event
@@ -272,6 +285,15 @@ def build_streaming_pipeline(
             clean | f"{spec.name}_WriteRaw" >> WriteToBigQuery(
                 f"{project}:{spec.raw_table}", **write_cfg
             )
+
+            if spec.dlq_table:
+                dlq = (
+                    (parsed.dlq, valid.dlq)
+                    | f"{spec.name}_DlqFlatten" >> beam.Flatten()
+                )
+                dlq | f"{spec.name}_WriteDlq" >> WriteToBigQuery(
+                    f"{project}:{spec.dlq_table}", **write_cfg
+                )
 
             if spec.enriched_table:
                 agg = (

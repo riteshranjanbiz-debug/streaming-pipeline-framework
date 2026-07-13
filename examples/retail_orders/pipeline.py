@@ -122,6 +122,7 @@ ORDERS_DOMAIN = DomainSpec(
     raw_table="raw.order_events",
     envelope_required=ENVELOPE_REQUIRED,
     payload_required=PAYLOAD_REQUIRED,
+    dlq_table="raw.order_events_dlq",  # malformed/invalid events land here, not silently dropped
     enriched_table="enriched.order_summary_5min",
     key_fn=order_key,
     aggregate_fn=AggregateOrderWindow,
@@ -129,9 +130,28 @@ ORDERS_DOMAIN = DomainSpec(
 )
 
 
+def _build_incident_notifier():
+    """
+    Opts into ServiceNow incident creation on pipeline crash, only if the
+    required env vars are set — so this example still runs without
+    ServiceNow configured at all (notifier stays None, crash-hook is a
+    no-op). See streaming_pipeline_framework.servicenow.ServiceNowClient
+    and health.run_with_incident_on_failure for what this wires up.
+    """
+    import os
+
+    if not os.environ.get("SERVICENOW_INSTANCE_URL"):
+        return None
+
+    from streaming_pipeline_framework.servicenow import ServiceNowClient
+
+    return ServiceNowClient.from_env()
+
+
 if __name__ == "__main__":
     cli_main(
         [ORDERS_DOMAIN],
         alerts_table="raw.alerts",
         description="Retail order events pipeline (streaming-pipeline-framework example)",
+        incident_notifier=_build_incident_notifier(),
     )

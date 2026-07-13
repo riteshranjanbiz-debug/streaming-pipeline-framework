@@ -10,6 +10,7 @@ import argparse
 import logging
 
 from .framework import DomainSpec, PipelineOptions, StandardOptions, build_streaming_pipeline
+from .health import IncidentNotifier, run_with_incident_on_failure
 
 
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
@@ -35,8 +36,15 @@ def main(
     description: str = "Streaming pipeline",
     window_secs: int = 300,
     pipeline_version: str = "1.0",
+    incident_notifier: IncidentNotifier | None = None,
 ) -> None:
-    """Parse standard CLI args and run `build_streaming_pipeline`."""
+    """
+    Parse standard CLI args and run `build_streaming_pipeline`.
+
+    `incident_notifier`: optional (e.g. a `ServiceNowClient`). If given, any
+    uncaught exception during pipeline execution creates an incident before
+    re-raising — see `health.run_with_incident_on_failure`. Omit to disable.
+    """
     parser = build_arg_parser(description)
     args, beam_args = parser.parse_known_args()
 
@@ -53,11 +61,17 @@ def main(
     options.view_as(StandardOptions).streaming = True
 
     logging.basicConfig(level=logging.INFO)
-    build_streaming_pipeline(
-        args.project,
-        domains,
-        alerts_table,
-        options,
-        window_secs=window_secs,
-        pipeline_version=pipeline_version,
+
+    def _run() -> None:
+        build_streaming_pipeline(
+            args.project,
+            domains,
+            alerts_table,
+            options,
+            window_secs=window_secs,
+            pipeline_version=pipeline_version,
+        )
+
+    run_with_incident_on_failure(
+        _run, incident_notifier, pipeline_name=description, project=args.project
     )

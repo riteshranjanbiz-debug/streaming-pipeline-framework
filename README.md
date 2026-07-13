@@ -28,9 +28,10 @@ with insurance.
 ## Install
 
 ```bash
-pip install -e .            # core: no Beam dependency, DoFns are unit-testable
-pip install -e ".[gcp]"     # + apache-beam[gcp], needed to actually run a pipeline
-pip install -e ".[dev]"     # + pytest
+pip install -e .              # core: no dependencies, DoFns are unit-testable
+pip install -e ".[gcp]"       # + apache-beam[gcp], needed to actually run a pipeline
+pip install -e ".[servicenow]" # + requests, needed for ServiceNowClient
+pip install -e ".[dev]"       # + pytest, requests, responses (for the test suite)
 ```
 
 The core package has **zero required dependencies** — `framework.py` falls
@@ -103,6 +104,55 @@ without running anything):
 python -m examples.retail_orders.pipeline --project <gcp-project> --runner DirectRunner
 ```
 
+## Incident creation on pipeline failure
+
+Two independent, opt-in triggers, both in `health.py`, both accepting any
+notifier with a `.create_incident(short_description, ...)` method — the
+built-in `ServiceNowClient`, or your own:
+
+**1. Pipeline crash.** Pass `incident_notifier=` to `cli.main()`:
+
+```python
+from streaming_pipeline_framework.cli import main
+from streaming_pipeline_framework.servicenow import ServiceNowClient
+
+main(
+    [orders],
+    alerts_table="raw.alerts",
+    incident_notifier=ServiceNowClient.from_env(),  # reads SERVICENOW_* env vars
+)
+```
+
+Any uncaught exception during pipeline execution — a `DirectRunner` crash, or
+a Dataflow job that reaches `FAILED` while the submitting process is blocked
+in `wait_until_finish()` — creates an incident with the error and full
+traceback, then re-raises (the process still exits non-zero as before; a
+failure to create the incident itself is logged, never masks the original
+error). `ServiceNowClient.from_env()` reads `SERVICENOW_INSTANCE_URL`,
+`SERVICENOW_CLIENT_ID`, `SERVICENOW_CLIENT_SECRET` — an OAuth
+client-credentials app registered on the ServiceNow side, credentials never
+hardcoded. Requires `pip install ".[servicenow]"`.
+
+**2. DLQ volume.** A crash alone won't catch a pipeline that's alive and
+running but silently dropping a chunk of its traffic (bad upstream data, a
+schema drift). Set `dlq_table` on a `DomainSpec` so invalid/malformed events
+are persisted instead of discarded, then run `check_dlq_thresholds`
+periodically (Cloud Scheduler + Cloud Function/Run, or plain cron — this is
+deliberately *not* part of the streaming pipeline itself):
+
+```python
+from google.cloud import bigquery
+from streaming_pipeline_framework.health import check_dlq_thresholds
+
+check_dlq_thresholds(
+    bigquery.Client(project="my-project"), "my-project", [orders],
+    window_minutes=15, threshold=10, notifier=ServiceNowClient.from_env(),
+)
+```
+
+See `examples/retail_orders/check_health.py` for a complete, runnable
+version of this.
+
 ## What the framework does *not* do
 
 - **Aggregation math and alert thresholds are yours.** `AggregateOrderWindow`
@@ -113,6 +163,9 @@ python -m examples.retail_orders.pipeline --project <gcp-project> --runner Direc
 - **No serving layer.** Pair this with whatever API/dashboard framework you
   like on the BigQuery output side — SalesServiceHub uses FastAPI + a static
   dashboard, but that's a separate concern from this package.
+- **No incident lifecycle management.** `create_incident` only creates —
+  resolution, assignment routing, dedup/throttling of repeated alerts, and
+  escalation policy all stay on the ServiceNow side.
 
 ## Testing
 
@@ -121,8 +174,14 @@ pip install -e ".[dev]"
 pytest
 ```
 
-`tests/test_framework.py` unit-tests every generic `DoFn` (`ParseMessage`,
-`ValidateEvent`, `EnrichEvent`, `StripInternalFields`, `DetectAlerts`) and
-`DomainSpec`'s validation, using a synthetic "widget" domain — deliberately
-not insurance or retail, to keep the tests honest about what's actually
-generic.
+- `tests/test_framework.py` — every generic `DoFn` (`ParseMessage`,
+  `ValidateEvent`, `EnrichEvent`, `StripInternalFields`, `DetectAlerts`) and
+  `DomainSpec`'s validation, using a synthetic "widget" domain — deliberately
+  not insurance or retail, to keep the tests honest about what's actually
+  generic.
+- `tests/test_servicenow.py` — the OAuth token flow (fetch, cache, refresh
+  on expiry) and incident creation, fully mocked via `responses`; no real
+  ServiceNow instance is contacted.
+- `tests/test_health.py` — the crash-incident hook (including that a
+  notifier failure never masks the original pipeline error) and the DLQ
+  threshold check, against a fake BigQuery client.
