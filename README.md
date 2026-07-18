@@ -88,6 +88,15 @@ python my_pipeline.py --project <gcp-project> --runner DataflowRunner \
 `build_streaming_pipeline` for you. You can also call
 `build_streaming_pipeline` directly if you want a different CLI shape.
 
+**`DirectRunner` + `STORAGE_WRITE_API` (the default `write_method`) don't mix.**
+`STORAGE_WRITE_API` is a cross-language (Java-backed) transform, and Beam's
+streaming `DirectRunner` refuses to run cross-language pipelines at all — you'll
+see `RuntimeError: Streaming Python direct runner does not support
+cross-language pipelines`. For local testing, pass `write_method="STREAMING_INSERTS"`
+to `main()`/`build_streaming_pipeline()` instead; switch back to the default
+once you're running on `DataflowRunner`, which handles cross-language
+transforms itself.
+
 ## Example: retail order events
 
 `examples/retail_orders/pipeline.py` is a complete, runnable second domain —

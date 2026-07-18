@@ -25,6 +25,7 @@ from streaming_pipeline_framework.framework import (
     _TaggedOutput,
     beam,
     Metrics,
+    build_streaming_pipeline,
 )
 
 
@@ -404,3 +405,41 @@ class TestMetricsShim:
         Metrics.counter("ns", "name").inc()
         Metrics.counter("ns", "name").dec()
         Metrics.distribution("ns", "name").update(5)
+
+
+# ── build_streaming_pipeline schema validation ──────────────────────────────
+# These raise before build_streaming_pipeline ever touches beam.Pipeline, so
+# they're safe to call directly (unlike the rest of the function, which
+# isn't unit-tested — see tests/test_dedup_integration.py and
+# tests/test_aggregate_integration.py, which mirror its composition instead
+# of calling it, precisely to avoid needing a real running pipeline).
+
+class TestBuildStreamingPipelineSchemaValidation:
+    def test_raw_table_schema_required_for_storage_write_api(self):
+        spec = DomainSpec(name="widgets", topic="widget-events", raw_table="raw.widgets")
+        with pytest.raises(ValueError, match="raw_table_schema is required"):
+            build_streaming_pipeline("test-project", [spec], None, options=None)
+
+    def test_enriched_table_schema_required_for_storage_write_api(self):
+        spec = DomainSpec(
+            name="widgets", topic="widget-events", raw_table="raw.widgets",
+            raw_table_schema={"fields": []},
+            enriched_table="enriched.widgets_5min",
+            key_fn=lambda e: e["event_type"],
+            aggregate_fn=lambda: object(),
+        )
+        with pytest.raises(ValueError, match="enriched_table_schema is required"):
+            build_streaming_pipeline("test-project", [spec], None, options=None)
+
+    def test_alerts_table_schema_required_for_storage_write_api(self):
+        spec = DomainSpec(
+            name="widgets", topic="widget-events", raw_table="raw.widgets",
+            raw_table_schema={"fields": []},
+            enriched_table="enriched.widgets_5min",
+            enriched_table_schema={"fields": []},
+            key_fn=lambda e: e["event_type"],
+            aggregate_fn=lambda: object(),
+            alert_evaluator=lambda agg: [],
+        )
+        with pytest.raises(ValueError, match="alerts_table_schema is required"):
+            build_streaming_pipeline("test-project", [spec], "raw.alerts", options=None)

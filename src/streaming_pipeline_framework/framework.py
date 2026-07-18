@@ -171,6 +171,30 @@ class DomainSpec:
                             of silently discarded) with an `_error` field.
                             Needed if you want to monitor DLQ volume as a
                             pipeline-health signal — see `health.py`.
+                            Always written via BigQuery's legacy streaming
+                            inserts, regardless of `write_method` — DLQ rows
+                            come from several different failure points with
+                            different field sets, which doesn't fit the
+                            Storage Write API's strict, single, exact-schema
+                            requirement. No `dlq_table_schema` field exists
+                            for this reason; the table just needs to already
+                            exist with a schema wide enough to cover
+                            whatever a given domain's failure paths produce.
+
+    BigQuery schemas (each a dict shaped `{"fields": [{"name", "type",
+    "mode", "fields": [...]}, ...]}` — see any `apache_beam.io.gcp.bigquery`
+    example, or `examples/retail_orders/pipeline.py` for a worked one).
+    Required when `write_method="STORAGE_WRITE_API"` (the framework's
+    default) for any table that's actually written to — the Storage Write
+    API needs to know field types up front to build its write protocol; it
+    cannot infer them from an already-existing BigQuery table the way
+    legacy streaming inserts effectively can. `build_streaming_pipeline`
+    raises a clear `ValueError` at build time if one's missing, rather than
+    letting Beam fail deep inside pipeline construction. Not needed at all
+    if using `write_method="STREAMING_INSERTS"`.
+      raw_table_schema        schema for `raw_table`
+      enriched_table_schema   schema for `enriched_table` (only meaningful
+                             alongside aggregation)
 
     Deduplication (optional — omit to skip; recommended if exactly-once
     downstream rows matter, since Pub/Sub is at-least-once and *will*
@@ -201,6 +225,8 @@ class DomainSpec:
     dlq_table: Optional[str] = None
     dedup_key_fn: Optional[Callable[[dict], Any]] = None
     dedup_window_secs: int = 600
+    raw_table_schema: Optional[dict] = None
+    enriched_table_schema: Optional[dict] = None
 
     def __post_init__(self):
         has_agg = (self.enriched_table, self.key_fn, self.aggregate_fn)
@@ -540,6 +566,7 @@ def build_streaming_pipeline(
     write_method: str = "STORAGE_WRITE_API",
     triggering_frequency_secs: int = 5,
     use_storage_api_auto_sharding: bool = True,
+    alerts_table_schema: Optional[dict] = None,
 ) -> None:
     """
     Wires one Beam pipeline covering every domain in `domains`. Each domain
@@ -548,6 +575,10 @@ def build_streaming_pipeline(
     alert branch.
 
     `alerts_table` is required if any domain sets an `alert_evaluator`.
+    `alerts_table_schema` likewise, but only when `write_method` is
+    `STORAGE_WRITE_API` — see `DomainSpec`'s docstring for the schema shape
+    and why it's needed. (`raw_table_schema`/`enriched_table_schema` are
+    per-domain, set directly on the `DomainSpec`.)
 
     `write_method` defaults to the BigQuery Storage Write API rather than
     legacy streaming inserts: higher throughput, cheaper, and — combined
@@ -556,10 +587,47 @@ def build_streaming_pipeline(
     is left at Beam's default (False), i.e. exactly-once write semantics.
     `triggering_frequency_secs` controls how often batches commit; lower is
     lower-latency, higher is fewer/cheaper API calls. Pass
-    `write_method="STREAMING_INSERTS"` to opt back into the legacy sink.
+    `write_method="STREAMING_INSERTS"` to opt back into the legacy sink
+    (which doesn't need any of the `*_table_schema` fields).
+
+    DLQ tables are always written via legacy streaming inserts regardless of
+    `write_method` — see `DomainSpec.dlq_table`'s docstring for why.
+
+    A `runner="DirectRunner"` streaming pipeline (Pub/Sub source +
+    `STORAGE_WRITE_API`) cannot run locally at all: `STORAGE_WRITE_API` is a
+    cross-language (Java-backed) transform, and Beam's streaming
+    `DirectRunner` categorically refuses to run cross-language pipelines
+    ("Streaming Python direct runner does not support cross-language
+    pipelines"). Its own suggested fallback, `PrismRunner`, doesn't support
+    `ReadFromPubSub` either (as of apache-beam 2.75). Local testing of the
+    full pipeline therefore only works with `write_method="STREAMING_INSERTS"`
+    — use that to smoke-test locally, then switch to `DataflowRunner` (which
+    handles cross-language transforms itself) to actually exercise
+    `STORAGE_WRITE_API`.
     """
     if any(d.alert_evaluator for d in domains) and not alerts_table:
         raise ValueError("alerts_table is required when any domain has an alert_evaluator")
+
+    if write_method == "STORAGE_WRITE_API":
+        for spec in domains:
+            if not spec.raw_table_schema:
+                raise ValueError(
+                    f"DomainSpec {spec.name!r}: raw_table_schema is required "
+                    "when write_method='STORAGE_WRITE_API' (see DomainSpec's "
+                    "docstring) — pass write_method='STREAMING_INSERTS' if "
+                    "you don't want to supply one"
+                )
+            if spec.enriched_table and not spec.enriched_table_schema:
+                raise ValueError(
+                    f"DomainSpec {spec.name!r}: enriched_table_schema is "
+                    "required when write_method='STORAGE_WRITE_API' and "
+                    "enriched_table is set"
+                )
+        if any(d.alert_evaluator for d in domains) and not alerts_table_schema:
+            raise ValueError(
+                "alerts_table_schema is required when write_method="
+                "'STORAGE_WRITE_API' and any domain has an alert_evaluator"
+            )
 
     write_cfg: dict[str, Any] = dict(
         create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
@@ -569,6 +637,16 @@ def build_streaming_pipeline(
     if write_method == "STORAGE_WRITE_API":
         write_cfg["triggering_frequency"] = triggering_frequency_secs
         write_cfg["with_auto_sharding"] = use_storage_api_auto_sharding
+
+    # DLQ rows come from several different failure points with different
+    # field sets (see DomainSpec.dlq_table) — incompatible with Storage
+    # Write API's single, strict, exact schema. Always use the more
+    # tolerant legacy path for this one sink.
+    dlq_write_cfg: dict[str, Any] = dict(
+        create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
+        write_disposition=BigQueryDisposition.WRITE_APPEND,
+        method="STREAMING_INSERTS",
+    )
 
     with beam.Pipeline(options=options) as p:
         for spec in domains:
@@ -601,7 +679,7 @@ def build_streaming_pipeline(
             clean = enriched.ok | f"{spec.name}_Strip" >> beam.ParDo(StripInternalFields())
 
             clean | f"{spec.name}_WriteRaw" >> WriteToBigQuery(
-                f"{project}:{spec.raw_table}", **write_cfg
+                f"{project}:{spec.raw_table}", schema=spec.raw_table_schema, **write_cfg
             )
 
             keyed = None
@@ -622,7 +700,7 @@ def build_streaming_pipeline(
                     _AttachWindowAndKey(spec.key_field_names, spec.name)
                 ).with_outputs("dlq", main="ok")
                 agg.ok | f"{spec.name}_WriteAgg" >> WriteToBigQuery(
-                    f"{project}:{spec.enriched_table}", **write_cfg
+                    f"{project}:{spec.enriched_table}", schema=spec.enriched_table_schema, **write_cfg
                 )
 
                 if spec.alert_evaluator:
@@ -630,7 +708,7 @@ def build_streaming_pipeline(
                         DetectAlerts(spec.alert_evaluator, spec.name)
                     ).with_outputs("dlq", main="ok")
                     alerts.ok | f"{spec.name}_WriteAlerts" >> WriteToBigQuery(
-                        f"{project}:{alerts_table}", **write_cfg
+                        f"{project}:{alerts_table}", schema=alerts_table_schema, **write_cfg
                     )
 
             if spec.dlq_table:
@@ -643,5 +721,5 @@ def build_streaming_pipeline(
                     dlq_branches.append(alerts.dlq)
                 dlq = tuple(dlq_branches) | f"{spec.name}_DlqFlatten" >> beam.Flatten()
                 dlq | f"{spec.name}_WriteDlq" >> WriteToBigQuery(
-                    f"{project}:{spec.dlq_table}", **write_cfg
+                    f"{project}:{spec.dlq_table}", **dlq_write_cfg
                 )

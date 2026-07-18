@@ -39,6 +39,7 @@ def main(
     incident_notifier: IncidentNotifier | None = None,
     write_method: str = "STORAGE_WRITE_API",
     triggering_frequency_secs: int = 5,
+    alerts_table_schema: dict | None = None,
 ) -> None:
     """
     Parse standard CLI args and run `build_streaming_pipeline`.
@@ -47,9 +48,11 @@ def main(
     uncaught exception during pipeline execution creates an incident before
     re-raising — see `health.run_with_incident_on_failure`. Omit to disable.
 
-    `write_method`/`triggering_frequency_secs`: see
+    `write_method`/`triggering_frequency_secs`/`alerts_table_schema`: see
     `build_streaming_pipeline`'s docstring — defaults to the BigQuery
-    Storage Write API (exactly-once), not legacy streaming inserts.
+    Storage Write API (exactly-once), not legacy streaming inserts, which
+    means `alerts_table_schema` and each domain's `raw_table_schema`/
+    `enriched_table_schema` are required.
     """
     parser = build_arg_parser(description)
     args, beam_args = parser.parse_known_args()
@@ -78,6 +81,7 @@ def main(
             pipeline_version=pipeline_version,
             write_method=write_method,
             triggering_frequency_secs=triggering_frequency_secs,
+            alerts_table_schema=alerts_table_schema,
         )
 
     run_with_incident_on_failure(
