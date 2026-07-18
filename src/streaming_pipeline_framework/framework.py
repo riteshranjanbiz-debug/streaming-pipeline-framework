@@ -521,8 +521,16 @@ class _AttachWindowAndKey(beam.DoFn):
         yield {
             **agg,
             **_zip_key(key, self.key_field_names),
-            "window_start": window.start.to_utc_datetime().isoformat(),
-            "window_end": window.end.to_utc_datetime().isoformat(),
+            # Timestamp.to_utc_datetime() returns a naive datetime (tzinfo=
+            # None) despite the name — explicitly attach UTC so the
+            # isoformat() string always carries an offset, consistent with
+            # every other timestamp string this framework produces (e.g.
+            # EnrichEvent's datetime.now(timezone.utc).isoformat()).
+            # Without this, _coerce_timestamps_for_schema's
+            # datetime.fromisoformat() round-trip produces a naive datetime
+            # that Timestamp.from_utc_datetime() rejects outright.
+            "window_start": window.start.to_utc_datetime().replace(tzinfo=timezone.utc).isoformat(),
+            "window_end": window.end.to_utc_datetime().replace(tzinfo=timezone.utc).isoformat(),
         }
 
 
@@ -576,7 +584,15 @@ def _coerce_timestamps_for_schema(row: dict, schema: dict) -> dict:
             continue
         field_type = field.get("type")
         if field_type == "TIMESTAMP" and isinstance(value, str):
-            out[name] = Timestamp.from_utc_datetime(datetime.fromisoformat(value))
+            parsed = datetime.fromisoformat(value)
+            # This framework's convention is tz-aware ISO strings
+            # everywhere, but Timestamp.from_utc_datetime() rejects naive
+            # ones outright rather than assuming a timezone — treat a
+            # naive string as UTC (the only timezone anything in this
+            # framework ever produces) instead of crashing the bundle.
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            out[name] = Timestamp.from_utc_datetime(parsed)
         elif field_type in ("RECORD", "STRUCT") and isinstance(value, dict):
             out[name] = _coerce_timestamps_for_schema(value, field)
     return out

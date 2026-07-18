@@ -273,8 +273,13 @@ class TestDlqWrappingCombineFn:
 
 class TestAttachWindowAndKey:
     def _fake_window(self):
-        start = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        end = datetime(2026, 1, 1, 0, 5, 0, tzinfo=timezone.utc)
+        # apache_beam.utils.timestamp.Timestamp.to_utc_datetime() returns a
+        # *naive* datetime (tzinfo=None) despite the name — mirror that
+        # exactly here rather than a tz-aware one, which is what let the
+        # naive-datetime bug this class now guards against slip past this
+        # test suite in the first place.
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        end = datetime(2026, 1, 1, 0, 5, 0)
         return SimpleNamespace(
             start=SimpleNamespace(to_utc_datetime=lambda: start),
             end=SimpleNamespace(to_utc_datetime=lambda: end),
@@ -290,6 +295,19 @@ class TestAttachWindowAndKey:
         assert row["event_type"] == "widget.created"
         assert row["color"] == "red"
         assert "window_start" in row and "window_end" in row
+
+    def test_window_timestamps_are_timezone_aware(self):
+        # Regression test: to_utc_datetime() being naive means a bare
+        # .isoformat() call silently drops the UTC offset, which then
+        # crashes _coerce_timestamps_for_schema's
+        # Timestamp.from_utc_datetime() round-trip for STORAGE_WRITE_API
+        # writes (confirmed against a real Dataflow job).
+        dofn = _AttachWindowAndKey(key_field_names=None, domain="widgets")
+        kv = ("widget.created", {"event_count": 1})
+        result = list(dofn.process(kv, window=self._fake_window()))
+        row = result[0]
+        assert datetime.fromisoformat(row["window_start"]).tzinfo is not None
+        assert datetime.fromisoformat(row["window_end"]).tzinfo is not None
 
     def test_no_key_field_names_omits_key_fields(self):
         dofn = _AttachWindowAndKey(key_field_names=None, domain="widgets")
@@ -498,3 +516,14 @@ class TestCoerceTimestampsForSchema:
                "payload": {"order_total": 9.99, "placed_at": None}}
         _coerce_timestamps_for_schema(row, self.SCHEMA)
         assert row["ingested_at"] == "2026-01-01T00:00:00+00:00"
+
+    def test_naive_timestamp_string_treated_as_utc(self):
+        # Regression test: apache_beam.utils.timestamp.Timestamp.
+        # to_utc_datetime() returns a naive datetime, so a bare .isoformat()
+        # call (as _AttachWindowAndKey used to do) produces a string with no
+        # UTC offset — confirmed to crash Timestamp.from_utc_datetime()
+        # against a real Dataflow job. Assume UTC instead of raising.
+        row = {"event_id": "evt-1", "ingested_at": "2026-01-01T00:00:00",
+               "payload": {"order_total": 9.99, "placed_at": None}}
+        out = _coerce_timestamps_for_schema(row, self.SCHEMA)
+        assert type(out["ingested_at"]).__name__ == "Timestamp"
