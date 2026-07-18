@@ -26,6 +26,8 @@ from streaming_pipeline_framework.framework import (
     beam,
     Metrics,
     build_streaming_pipeline,
+    _coerce_timestamps_for_schema,
+    BEAM_AVAILABLE,
 )
 
 
@@ -443,3 +445,56 @@ class TestBuildStreamingPipelineSchemaValidation:
         )
         with pytest.raises(ValueError, match="alerts_table_schema is required"):
             build_streaming_pipeline("test-project", [spec], "raw.alerts", options=None)
+
+
+# ── _coerce_timestamps_for_schema ───────────────────────────────────────────
+# STORAGE_WRITE_API's schema-aware row conversion requires TIMESTAMP fields
+# to be real apache_beam.utils.timestamp.Timestamp objects, not the ISO
+# strings every DoFn in this framework produces — see _write_bigquery. This
+# helper (and only this helper) needs the real apache_beam.utils.timestamp.
+# Timestamp class, which is None in the no-beam shim, so these tests only
+# run with apache-beam installed.
+
+@pytest.mark.skipif(not BEAM_AVAILABLE, reason="needs real apache_beam.utils.timestamp.Timestamp")
+class TestCoerceTimestampsForSchema:
+    SCHEMA = {
+        "fields": [
+            {"name": "event_id", "type": "STRING", "mode": "REQUIRED"},
+            {"name": "ingested_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
+            {
+                "name": "payload", "type": "RECORD", "mode": "REQUIRED",
+                "fields": [
+                    {"name": "order_total", "type": "FLOAT", "mode": "REQUIRED"},
+                    {"name": "placed_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
+                ],
+            },
+        ]
+    }
+
+    def test_converts_top_level_timestamp_string(self):
+        from apache_beam.utils.timestamp import Timestamp
+
+        row = {"event_id": "evt-1", "ingested_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"order_total": 9.99, "placed_at": None}}
+        out = _coerce_timestamps_for_schema(row, self.SCHEMA)
+        assert isinstance(out["ingested_at"], Timestamp)
+
+    def test_leaves_non_timestamp_fields_untouched(self):
+        row = {"event_id": "evt-1", "ingested_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"order_total": 9.99, "placed_at": None}}
+        out = _coerce_timestamps_for_schema(row, self.SCHEMA)
+        assert out["event_id"] == "evt-1"
+        assert out["payload"]["order_total"] == 9.99
+        assert out["payload"]["placed_at"] is None
+
+    def test_recurses_into_record_fields(self):
+        row = {"event_id": "evt-1", "ingested_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"order_total": 9.99, "placed_at": "2026-01-01T00:05:00+00:00"}}
+        out = _coerce_timestamps_for_schema(row, self.SCHEMA)
+        assert type(out["payload"]["placed_at"]).__name__ == "Timestamp"
+
+    def test_does_not_mutate_input_row(self):
+        row = {"event_id": "evt-1", "ingested_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"order_total": 9.99, "placed_at": None}}
+        _coerce_timestamps_for_schema(row, self.SCHEMA)
+        assert row["ingested_at"] == "2026-01-01T00:00:00+00:00"

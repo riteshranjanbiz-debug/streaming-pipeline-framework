@@ -35,6 +35,7 @@ try:
     from apache_beam.transforms.window import FixedWindows
     from apache_beam.transforms.trigger import AccumulationMode, AfterProcessingTime, AfterWatermark
     from apache_beam.metrics import Metrics
+    from apache_beam.utils.timestamp import Timestamp
 
     _TaggedOutput = beam.pvalue.TaggedOutput
     BEAM_AVAILABLE = True
@@ -90,6 +91,7 @@ except ImportError:
     AccumulationMode = None  # type: ignore[assignment]
     AfterProcessingTime = None  # type: ignore[assignment]
     AfterWatermark = None  # type: ignore[assignment]
+    Timestamp = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -552,6 +554,46 @@ def _window_transform(spec: "DomainSpec", window_secs: int) -> "beam.WindowInto"
     )
 
 
+def _coerce_timestamps_for_schema(row: dict, schema: dict) -> dict:
+    """Every DoFn in this framework stamps timestamps as ISO 8601 strings
+    (`datetime.isoformat()`) — the natural representation for JSON messages
+    and for BigQuery's legacy streaming inserts, which JSON-encode rows
+    directly. But the Storage Write API's schema-aware row conversion
+    requires TIMESTAMP-typed fields to be actual
+    `apache_beam.utils.timestamp.Timestamp` objects (it calls `.micros` on
+    the value directly — see `apache_beam.typehints.schemas.MicrosInstant`)
+    and, conversely, a `Timestamp` object isn't JSON-serializable, so it
+    would break legacy streaming inserts (which DLQ writes always use).
+    Rather than making every DoFn write-method-aware, this converts
+    schema-declared TIMESTAMP string fields (recursing into RECORD fields)
+    just-in-time, right before a STORAGE_WRITE_API write — see where it's
+    called in build_streaming_pipeline."""
+    out = dict(row)
+    for field in schema.get("fields", ()):
+        name = field.get("name")
+        value = out.get(name)
+        if value is None:
+            continue
+        field_type = field.get("type")
+        if field_type == "TIMESTAMP" and isinstance(value, str):
+            out[name] = Timestamp.from_utc_datetime(datetime.fromisoformat(value))
+        elif field_type in ("RECORD", "STRUCT") and isinstance(value, dict):
+            out[name] = _coerce_timestamps_for_schema(value, field)
+    return out
+
+
+def _write_bigquery(pcoll, label: str, table: str, schema: Optional[dict], write_method: str, write_cfg: dict):
+    """WriteToBigQuery wrapper that inserts the STORAGE_WRITE_API timestamp
+    coercion (see _coerce_timestamps_for_schema) only when it's actually
+    needed — STREAMING_INSERTS rows pass through unchanged, and so does any
+    write without a schema (DLQ writes, which are schema-less by design)."""
+    if write_method == "STORAGE_WRITE_API" and schema:
+        pcoll = pcoll | f"{label}_CoerceTimestamps" >> beam.Map(
+            lambda row: _coerce_timestamps_for_schema(row, schema)
+        )
+    return pcoll | label >> WriteToBigQuery(table, schema=schema, **write_cfg)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Pipeline builder
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -678,8 +720,9 @@ def build_streaming_pipeline(
             ).with_outputs("dlq", main="ok")
             clean = enriched.ok | f"{spec.name}_Strip" >> beam.ParDo(StripInternalFields())
 
-            clean | f"{spec.name}_WriteRaw" >> WriteToBigQuery(
-                f"{project}:{spec.raw_table}", schema=spec.raw_table_schema, **write_cfg
+            _write_bigquery(
+                clean, f"{spec.name}_WriteRaw", f"{project}:{spec.raw_table}",
+                spec.raw_table_schema, write_method, write_cfg,
             )
 
             keyed = None
@@ -699,16 +742,18 @@ def build_streaming_pipeline(
                 agg = combined | f"{spec.name}_AttachKeyWindow" >> beam.ParDo(
                     _AttachWindowAndKey(spec.key_field_names, spec.name)
                 ).with_outputs("dlq", main="ok")
-                agg.ok | f"{spec.name}_WriteAgg" >> WriteToBigQuery(
-                    f"{project}:{spec.enriched_table}", schema=spec.enriched_table_schema, **write_cfg
+                _write_bigquery(
+                    agg.ok, f"{spec.name}_WriteAgg", f"{project}:{spec.enriched_table}",
+                    spec.enriched_table_schema, write_method, write_cfg,
                 )
 
                 if spec.alert_evaluator:
                     alerts = agg.ok | f"{spec.name}_Alerts" >> beam.ParDo(
                         DetectAlerts(spec.alert_evaluator, spec.name)
                     ).with_outputs("dlq", main="ok")
-                    alerts.ok | f"{spec.name}_WriteAlerts" >> WriteToBigQuery(
-                        f"{project}:{alerts_table}", schema=alerts_table_schema, **write_cfg
+                    _write_bigquery(
+                        alerts.ok, f"{spec.name}_WriteAlerts", f"{project}:{alerts_table}",
+                        alerts_table_schema, write_method, write_cfg,
                     )
 
             if spec.dlq_table:
@@ -720,6 +765,7 @@ def build_streaming_pipeline(
                 if alerts is not None:
                     dlq_branches.append(alerts.dlq)
                 dlq = tuple(dlq_branches) | f"{spec.name}_DlqFlatten" >> beam.Flatten()
-                dlq | f"{spec.name}_WriteDlq" >> WriteToBigQuery(
-                    f"{project}:{spec.dlq_table}", **dlq_write_cfg
+                _write_bigquery(
+                    dlq, f"{spec.name}_WriteDlq", f"{project}:{spec.dlq_table}",
+                    None, "STREAMING_INSERTS", dlq_write_cfg,
                 )
