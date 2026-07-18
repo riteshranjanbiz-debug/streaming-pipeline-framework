@@ -5,6 +5,13 @@ Proves the framework is domain-agnostic — this has nothing to do with the
 insurance use case the framework was extracted from. Swap in your own
 DomainSpec, aggregator, and alert rules the same way.
 
+Models a retail funnel, not just completed orders: cart.item_added,
+cart.item_removed, cart.abandoned, order.created, order.cancelled,
+order.refunded. All six share the same envelope/payload shape — for cart
+events, payload.order_id doubles as a cart/session identifier and
+payload.order_total as the cart's value at that point (0 is fine for
+removal/abandonment events that don't carry a meaningful total).
+
 Run locally (DirectRunner, needs real Pub/Sub + BigQuery):
   python -m examples.retail_orders.pipeline --project <gcp-project> --runner DirectRunner
 
@@ -31,6 +38,7 @@ PAYLOAD_REQUIRED = frozenset({"order_id", "channel", "region", "order_total"})
 
 CANCELLATION_RATE_THRESHOLD = 0.15
 REFUND_SPIKE_THRESHOLD = 5_000.0
+CART_ABANDONMENT_RATE_THRESHOLD = 0.50
 
 # BigQuery schemas — required because write_method defaults to
 # STORAGE_WRITE_API, which (unlike legacy streaming inserts) needs field
@@ -62,11 +70,15 @@ ORDER_EVENTS_SCHEMA = {
 ORDER_SUMMARY_SCHEMA = {
     "fields": [
         {"name": "event_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "created_count", "type": "INTEGER", "mode": "REQUIRED"},
         {"name": "total_order_value", "type": "FLOAT", "mode": "REQUIRED"},
         {"name": "cancelled_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "refunded_count", "type": "INTEGER", "mode": "REQUIRED"},
         {"name": "refunded_amount", "type": "FLOAT", "mode": "REQUIRED"},
+        {"name": "cart_added_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "cart_removed_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "cart_abandoned_count", "type": "INTEGER", "mode": "REQUIRED"},
         {"name": "computed_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
-        {"name": "event_type", "type": "STRING", "mode": "REQUIRED"},
         {"name": "channel", "type": "STRING", "mode": "REQUIRED"},
         {"name": "region", "type": "STRING", "mode": "REQUIRED"},
         {"name": "window_start", "type": "TIMESTAMP", "mode": "REQUIRED"},
@@ -92,7 +104,6 @@ ALERTS_SCHEMA = {
         {
             "name": "context", "type": "RECORD", "mode": "NULLABLE",
             "fields": [
-                {"name": "event_type", "type": "STRING", "mode": "NULLABLE"},
                 {"name": "channel", "type": "STRING", "mode": "NULLABLE"},
                 {"name": "region", "type": "STRING", "mode": "NULLABLE"},
                 {"name": "event_count", "type": "INTEGER", "mode": "NULLABLE"},
@@ -106,43 +117,63 @@ ALERTS_SCHEMA = {
 def order_key(event: dict) -> tuple:
     payload = event.get("payload") or {}
     return (
-        event.get("event_type", "unknown"),
         payload.get("channel", "unknown"),
         payload.get("region", "unknown"),
     )
 
 
 class AggregateOrderWindow(beam.CombineFn):
-    """Key: (event_type, channel, region) — reattached to the output row by
-    the framework (see DomainSpec.key_field_names on ORDERS_DOMAIN below), not
+    """Key: (channel, region) — reattached to the output row by the
+    framework (see DomainSpec.key_field_names on ORDERS_DOMAIN below), not
     by this class. A CombineFn's methods never see the grouping key, so
-    window/key fields can't be attached here even if we wanted to."""
+    window/key fields can't be attached here even if we wanted to.
+
+    Deliberately keyed by (channel, region) only, not event_type: keying by
+    event_type too makes every cross-type rate — cancellation rate, cart
+    abandonment rate — structurally either 0% or 100%, since a single
+    window/key would then only ever contain one event type. Grouping every
+    event type together per (channel, region) is what makes those rates
+    meaningful.
+    """
 
     def create_accumulator(self):
         return {
             "event_count": 0,
+            "created_count": 0,
             "total_order_value": 0.0,
             "cancelled_count": 0,
+            "refunded_count": 0,
             "refunded_amount": 0.0,
+            "cart_added_count": 0,
+            "cart_removed_count": 0,
+            "cart_abandoned_count": 0,
         }
 
     def add_input(self, accumulator, event):
+        event_type = event.get("event_type")
         order_total = (event.get("payload") or {}).get("order_total") or 0
         accumulator["event_count"] += 1
-        accumulator["total_order_value"] += order_total
-        if event.get("event_type") == "order.cancelled":
+        if event_type == "order.created":
+            accumulator["created_count"] += 1
+            accumulator["total_order_value"] += order_total
+        elif event_type == "order.cancelled":
             accumulator["cancelled_count"] += 1
-        if event.get("event_type") == "order.refunded":
+        elif event_type == "order.refunded":
+            accumulator["refunded_count"] += 1
             accumulator["refunded_amount"] += order_total
+        elif event_type == "cart.item_added":
+            accumulator["cart_added_count"] += 1
+        elif event_type == "cart.item_removed":
+            accumulator["cart_removed_count"] += 1
+        elif event_type == "cart.abandoned":
+            accumulator["cart_abandoned_count"] += 1
         return accumulator
 
     def merge_accumulators(self, accumulators):
         merged = self.create_accumulator()
         for acc in accumulators:
-            merged["event_count"] += acc["event_count"]
-            merged["total_order_value"] += acc["total_order_value"]
-            merged["cancelled_count"] += acc["cancelled_count"]
-            merged["refunded_amount"] += acc["refunded_amount"]
+            for key in merged:
+                merged[key] += acc[key]
         return merged
 
     def extract_output(self, accumulator):
@@ -162,7 +193,6 @@ def _alert(alert_type: str, severity: str, agg: dict[str, Any],
         "metric_value": metric_value,
         "threshold": threshold,
         "context": {
-            "event_type": agg.get("event_type"),
             "channel": agg.get("channel"),
             "region": agg.get("region"),
             "event_count": agg.get("event_count"),
@@ -173,12 +203,14 @@ def _alert(alert_type: str, severity: str, agg: dict[str, Any],
 
 def evaluate_order_alerts(agg: dict[str, Any]) -> list[dict[str, Any]]:
     alerts = []
-    event_count = agg.get("event_count") or 0
+    created = agg.get("created_count") or 0
     cancelled = agg.get("cancelled_count") or 0
     refunded = agg.get("refunded_amount") or 0.0
+    cart_added = agg.get("cart_added_count") or 0
+    cart_abandoned = agg.get("cart_abandoned_count") or 0
 
-    if event_count > 0:
-        rate = cancelled / event_count
+    if created > 0:
+        rate = cancelled / created
         if rate >= CANCELLATION_RATE_THRESHOLD:
             alerts.append(_alert(
                 "high_cancellation_rate", "high" if rate >= 0.30 else "medium",
@@ -189,6 +221,14 @@ def evaluate_order_alerts(agg: dict[str, Any]) -> list[dict[str, Any]]:
         alerts.append(_alert(
             "refund_spike", "high", agg, "refunded_amount", refunded, REFUND_SPIKE_THRESHOLD,
         ))
+
+    if cart_added > 0:
+        rate = cart_abandoned / cart_added
+        if rate >= CART_ABANDONMENT_RATE_THRESHOLD:
+            alerts.append(_alert(
+                "high_cart_abandonment_rate", "high" if rate >= 0.75 else "medium",
+                agg, "cart_abandonment_rate", round(rate, 4), CART_ABANDONMENT_RATE_THRESHOLD,
+            ))
 
     return alerts
 
@@ -205,7 +245,7 @@ ORDERS_DOMAIN = DomainSpec(
     enriched_table_schema=ORDER_SUMMARY_SCHEMA,
     key_fn=order_key,
     aggregate_fn=AggregateOrderWindow,
-    key_field_names=("event_type", "channel", "region"),
+    key_field_names=("channel", "region"),
     alert_evaluator=evaluate_order_alerts,
 )
 

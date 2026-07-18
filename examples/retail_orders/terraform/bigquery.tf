@@ -8,6 +8,12 @@
 # autodetection on first write the way legacy streaming inserts sometimes
 # do — the table needs to already exist with a matching schema before the
 # pipeline runs.
+#
+# deletion_protection = false throughout: this is example/demo
+# infrastructure with disposable data, and schema changes here (e.g. adding
+# a field to AggregateOrderWindow's output) force table replacement, not an
+# in-place ALTER. Flip to true (the provider's own default) if you fork this
+# for a real deployment with data worth protecting.
 
 resource "google_bigquery_dataset" "raw" {
   dataset_id = "raw"
@@ -33,10 +39,11 @@ resource "google_bigquery_dataset" "enriched" {
 # required 4 would be dropped by BigQuery on write (no autodetect at write
 # time) — widen the payload RECORD here if your events carry more.
 resource "google_bigquery_table" "order_events" {
-  dataset_id = google_bigquery_dataset.raw.dataset_id
-  table_id   = "order_events"
-  project    = var.project_id
-  labels     = var.labels
+  dataset_id          = google_bigquery_dataset.raw.dataset_id
+  table_id            = "order_events"
+  project             = var.project_id
+  labels              = var.labels
+  deletion_protection = false
 
   schema = jsonencode([
     { name = "event_id", type = "STRING", mode = "REQUIRED" },
@@ -65,10 +72,11 @@ resource "google_bigquery_table" "order_events" {
 # definition not known-good — a RECORD schema would itself reject the kind
 # of malformed payload this table exists to capture.
 resource "google_bigquery_table" "order_events_dlq" {
-  dataset_id = google_bigquery_dataset.raw.dataset_id
-  table_id   = "order_events_dlq"
-  project    = var.project_id
-  labels     = var.labels
+  dataset_id          = google_bigquery_dataset.raw.dataset_id
+  table_id            = "order_events_dlq"
+  project             = var.project_id
+  labels              = var.labels
+  deletion_protection = false
 
   schema = jsonencode([
     { name = "_error", type = "STRING", mode = "REQUIRED" },
@@ -87,21 +95,29 @@ resource "google_bigquery_table" "order_events_dlq" {
   ])
 }
 
-# enriched.order_summary_5min — one row per (event_type, channel, region)
-# per 5-minute window, written by the CombineFn aggregation branch.
+# enriched.order_summary_5min — one row per (channel, region) per 5-minute
+# window, written by the CombineFn aggregation branch. Keyed by
+# (channel, region) only, not event_type — see AggregateOrderWindow's
+# docstring for why: that's what makes cancellation_rate/
+# cart_abandonment_rate meaningful cross-event-type metrics.
 resource "google_bigquery_table" "order_summary_5min" {
-  dataset_id = google_bigquery_dataset.enriched.dataset_id
-  table_id   = "order_summary_5min"
-  project    = var.project_id
-  labels     = var.labels
+  dataset_id          = google_bigquery_dataset.enriched.dataset_id
+  table_id            = "order_summary_5min"
+  project             = var.project_id
+  labels              = var.labels
+  deletion_protection = false
 
   schema = jsonencode([
     { name = "event_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "created_count", type = "INTEGER", mode = "REQUIRED" },
     { name = "total_order_value", type = "FLOAT64", mode = "REQUIRED" },
     { name = "cancelled_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "refunded_count", type = "INTEGER", mode = "REQUIRED" },
     { name = "refunded_amount", type = "FLOAT64", mode = "REQUIRED" },
+    { name = "cart_added_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "cart_removed_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "cart_abandoned_count", type = "INTEGER", mode = "REQUIRED" },
     { name = "computed_at", type = "TIMESTAMP", mode = "REQUIRED" },
-    { name = "event_type", type = "STRING", mode = "REQUIRED" },
     { name = "channel", type = "STRING", mode = "REQUIRED" },
     { name = "region", type = "STRING", mode = "REQUIRED" },
     { name = "window_start", type = "TIMESTAMP", mode = "REQUIRED" },
@@ -114,10 +130,11 @@ resource "google_bigquery_table" "order_summary_5min" {
 # _alert() shape specifically. A multi-domain deployment would need a schema
 # covering every domain's alert context, or a JSON `context` column instead.
 resource "google_bigquery_table" "alerts" {
-  dataset_id = google_bigquery_dataset.raw.dataset_id
-  table_id   = "alerts"
-  project    = var.project_id
-  labels     = var.labels
+  dataset_id          = google_bigquery_dataset.raw.dataset_id
+  table_id            = "alerts"
+  project             = var.project_id
+  labels              = var.labels
+  deletion_protection = false
 
   schema = jsonencode([
     { name = "alert_id", type = "STRING", mode = "REQUIRED" },
@@ -132,7 +149,6 @@ resource "google_bigquery_table" "alerts" {
     {
       name = "context", type = "RECORD", mode = "NULLABLE",
       fields = [
-        { name = "event_type", type = "STRING", mode = "NULLABLE" },
         { name = "channel", type = "STRING", mode = "NULLABLE" },
         { name = "region", type = "STRING", mode = "NULLABLE" },
         { name = "event_count", type = "INTEGER", mode = "NULLABLE" },
