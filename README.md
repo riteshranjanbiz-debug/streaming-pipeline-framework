@@ -116,6 +116,19 @@ terraform apply -var="project_id=<gcp-project>"
 terraform output run_command   # ready-to-run DataflowRunner invocation
 ```
 
+When you're done, tear it back down (a `Makefile` wraps the commands above,
+including this one — `make destroy PROJECT_ID=<gcp-project>`):
+
+```bash
+terraform destroy -var="project_id=<gcp-project>"
+```
+
+This deletes everything the module created but leaves the GCP project itself
+intact. Note it does **not** stop a Dataflow job you started separately —
+cancel that first (`gcloud dataflow jobs cancel <job-id>` or the Dataflow
+console), since that's the actual compute cost driver, not the supporting
+infrastructure.
+
 ## Incident creation on pipeline failure
 
 Two independent, opt-in triggers, both in `health.py`, both accepting any
