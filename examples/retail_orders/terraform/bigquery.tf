@@ -14,6 +14,8 @@ resource "google_bigquery_dataset" "raw" {
   project    = var.project_id
   location   = var.bigquery_dataset_location
   labels     = var.labels
+
+  depends_on = [google_project_service.required]
 }
 
 resource "google_bigquery_dataset" "enriched" {
@@ -21,6 +23,8 @@ resource "google_bigquery_dataset" "enriched" {
   project    = var.project_id
   location   = var.bigquery_dataset_location
   labels     = var.labels
+
+  depends_on = [google_project_service.required]
 }
 
 # raw.order_events — one row per validated/enriched order event.

@@ -19,4 +19,6 @@ resource "google_storage_bucket" "dataflow_temp" {
       type = "Delete"
     }
   }
+
+  depends_on = [google_project_service.required]
 }

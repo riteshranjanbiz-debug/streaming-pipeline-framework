@@ -2,6 +2,8 @@ resource "google_service_account" "dataflow_worker" {
   account_id   = var.service_account_id
   project      = var.project_id
   display_name = "Dataflow worker — streaming-pipeline-framework retail_orders example"
+
+  depends_on = [google_project_service.required]
 }
 
 # Broader than strictly necessary: ReadFromPubSub(topic=...) (not

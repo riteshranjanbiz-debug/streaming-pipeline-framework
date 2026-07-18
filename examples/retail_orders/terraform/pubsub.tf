@@ -3,6 +3,8 @@ resource "google_pubsub_topic" "order_events" {
   name    = "order-events"
   project = var.project_id
   labels  = var.labels
+
+  depends_on = [google_project_service.required]
 }
 
 # build_streaming_pipeline reads with ReadFromPubSub(topic=...), not
