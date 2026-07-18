@@ -31,7 +31,10 @@ try:
     import apache_beam as beam
     from apache_beam.io.gcp.bigquery import BigQueryDisposition, WriteToBigQuery
     from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+    from apache_beam.transforms.deduplicate import DeduplicatePerKey
     from apache_beam.transforms.window import FixedWindows
+    from apache_beam.transforms.trigger import AccumulationMode, AfterProcessingTime, AfterWatermark
+    from apache_beam.metrics import Metrics
 
     _TaggedOutput = beam.pvalue.TaggedOutput
     BEAM_AVAILABLE = True
@@ -52,8 +55,29 @@ except ImportError:
         def process(self, element: Any, *args: Any, **kwargs: Any):  # type: ignore[empty-body]
             ...
 
+    class _CombineFn:
+        def create_accumulator(self, *args: Any, **kwargs: Any) -> Any: ...
+        def add_input(self, accumulator: Any, input: Any, *args: Any, **kwargs: Any) -> Any: ...
+        def merge_accumulators(self, accumulators: Iterable[Any], *args: Any, **kwargs: Any) -> Any: ...
+        def extract_output(self, accumulator: Any, *args: Any, **kwargs: Any) -> Any: ...
+
+    class _FakeMetric:
+        def inc(self, n: int = 1) -> None: ...
+        def dec(self, n: int = 1) -> None: ...
+        def update(self, value: Any) -> None: ...
+
+    class Metrics:  # type: ignore[no-redef]
+        @staticmethod
+        def counter(namespace: str, name: str) -> "_FakeMetric":
+            return _FakeMetric()
+
+        @staticmethod
+        def distribution(namespace: str, name: str) -> "_FakeMetric":
+            return _FakeMetric()
+
     class _Beam:
         DoFn = _DoFn
+        CombineFn = _CombineFn
         pvalue = _PValue()
 
     beam = _Beam()  # type: ignore[assignment]
@@ -62,6 +86,10 @@ except ImportError:
     PipelineOptions = None  # type: ignore[assignment]
     StandardOptions = None  # type: ignore[assignment]
     FixedWindows = None  # type: ignore[assignment]
+    DeduplicatePerKey = None  # type: ignore[assignment]
+    AccumulationMode = None  # type: ignore[assignment]
+    AfterProcessingTime = None  # type: ignore[assignment]
+    AfterWatermark = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +123,44 @@ class DomainSpec:
       enriched_table      "dataset.table" for the windowed aggregate rows
       key_fn               dict -> grouping key (any hashable), e.g.
                            `lambda e: e["payload"]["region"]`
-      aggregate_fn         zero-arg factory returning a fresh `beam.DoFn`
-                           instance per bundle, e.g. `MyAggregateWindow`
-                           (pass the class itself, not an instance)
+      aggregate_fn         zero-arg factory returning a fresh `beam.CombineFn`
+                           instance, e.g. `MyAggregateWindow` (pass the class
+                           itself, not an instance). Implements
+                           create_accumulator/add_input/merge_accumulators/
+                           extract_output — partial combining happens before
+                           the shuffle, so hot keys don't bottleneck a single
+                           worker the way GroupByKey+ParDo would.
+      key_field_names       optional tuple of names to zip onto the tuple
+                           `key_fn` returns, reattached to each aggregate
+                           output row after combining, e.g.
+                           `("event_type", "channel")` for a `key_fn`
+                           returning `(e["event_type"], e["payload"]["channel"])`.
+                           A `CombineFn`'s methods never see the grouping key
+                           (Beam API constraint — they must also work for
+                           non-keyed combines), so `extract_output` cannot
+                           attach key fields itself; the framework does it
+                           generically instead. Omit if the output row
+                           doesn't need the key fields.
+
+    Windowing behavior (optional, only meaningful alongside aggregation;
+    defaults reproduce today's behavior exactly — a caller that never sets
+    these sees no change):
+      allowed_lateness_secs  how long past the watermark a late event can
+                            still update its window (default 0, i.e. Beam's
+                            own default — late events are dropped). Set this
+                            if upstream redelivery/clock skew means events
+                            can genuinely arrive after their window closes.
+      early_firing_secs      if set, the window emits speculative results
+                            every N seconds of processing time before the
+                            watermark closes it — trades a bit of accuracy
+                            for lower alerting latency. Omit for a single
+                            firing at the watermark (today's behavior).
+      accumulation_mode      "discarding" (default) or "accumulating".
+                            Only matters when allowed_lateness_secs or
+                            early_firing_secs cause more than one firing per
+                            window: "discarding" emits only the new data
+                            since the last firing, "accumulating" emits the
+                            running total each time.
 
     Alerting (optional, only meaningful alongside aggregation):
       alert_evaluator      windowed-aggregate dict -> list[alert dict]
@@ -108,6 +171,18 @@ class DomainSpec:
                             of silently discarded) with an `_error` field.
                             Needed if you want to monitor DLQ volume as a
                             pipeline-health signal — see `health.py`.
+
+    Deduplication (optional — omit to skip; recommended if exactly-once
+    downstream rows matter, since Pub/Sub is at-least-once and *will*
+    redeliver):
+      dedup_key_fn          dict -> hashable identity key, e.g.
+                            `lambda e: e["event_id"]`. Applied right after
+                            parsing, before validation, so duplicates don't
+                            waste validate/enrich work either.
+      dedup_window_secs      how long a key is remembered (default 600 =
+                            10 min). Bounded on purpose — unbounded dedup
+                            state isn't practical; pick a window comfortably
+                            longer than your realistic redelivery latency.
     """
 
     name: str
@@ -118,8 +193,14 @@ class DomainSpec:
     enriched_table: Optional[str] = None
     key_fn: Optional[Callable[[dict], Any]] = None
     aggregate_fn: Optional[Callable[[], Any]] = None
+    key_field_names: Optional[tuple[str, ...]] = None
+    allowed_lateness_secs: int = 0
+    early_firing_secs: Optional[int] = None
+    accumulation_mode: str = "discarding"
     alert_evaluator: Optional[Callable[[dict], list[dict]]] = None
     dlq_table: Optional[str] = None
+    dedup_key_fn: Optional[Callable[[dict], Any]] = None
+    dedup_window_secs: int = 600
 
     def __post_init__(self):
         has_agg = (self.enriched_table, self.key_fn, self.aggregate_fn)
@@ -134,18 +215,49 @@ class DomainSpec:
                 "windowed aggregation (enriched_table/key_fn/aggregate_fn) "
                 "to also be set"
             )
+        if self.key_field_names is not None and not all(has_agg):
+            raise ValueError(
+                f"DomainSpec {self.name!r}: key_field_names requires "
+                "windowed aggregation (enriched_table/key_fn/aggregate_fn) "
+                "to also be set"
+            )
+        if self.accumulation_mode not in ("discarding", "accumulating"):
+            raise ValueError(
+                f"DomainSpec {self.name!r}: accumulation_mode must be "
+                f"'discarding' or 'accumulating', got {self.accumulation_mode!r}"
+            )
+        has_windowing_config = (
+            self.allowed_lateness_secs != 0
+            or self.early_firing_secs is not None
+            or self.accumulation_mode != "discarding"
+        )
+        if has_windowing_config and not all(has_agg):
+            raise ValueError(
+                f"DomainSpec {self.name!r}: allowed_lateness_secs/"
+                "early_firing_secs/accumulation_mode requires windowed "
+                "aggregation (enriched_table/key_fn/aggregate_fn) to also "
+                "be set"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Generic transforms
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _dlq(error: str, event: Optional[dict] = None, **extra: Any) -> dict[str, Any]:
+def _ns(domain: str) -> str:
+    """Beam Metrics namespace convention for this framework."""
+    return f"streaming_pipeline_framework.{domain}"
+
+
+def _dlq(domain: str, error: str, event: Optional[dict] = None, **extra: Any) -> dict[str, Any]:
     """Builds a DLQ row with a consistent shape — every DLQ row (from any
     stage) has `_error` and `ingested_at`, so a single dlq_table can be
     queried uniformly (see health.check_dlq_thresholds). `event` is spread
     in as a plain dict (not **kwargs) so an event field literally named
-    `error` can never collide with this function's own `error` parameter."""
+    `error` can never collide with this function's own `error` parameter.
+    Also increments a `dlq_writes` counter — the single source of truth for
+    that metric, since every DLQ row in the pipeline is built here."""
+    Metrics.counter(_ns(domain), "dlq_writes").inc()
     return {
         **(event or {}),
         **extra,
@@ -157,11 +269,19 @@ def _dlq(error: str, event: Optional[dict] = None, **extra: Any) -> dict[str, An
 class ParseMessage(beam.DoFn):
     """Deserialize Pub/Sub bytes → dict. Malformed JSON goes to the 'dlq' tag."""
 
+    def __init__(self, domain: str = "unknown"):
+        self.domain = domain
+
     def process(self, message, *args, **kwargs):
         try:
-            yield json.loads(message.data.decode("utf-8"))
+            parsed = json.loads(message.data.decode("utf-8"))
         except Exception as e:
-            yield beam.pvalue.TaggedOutput("dlq", _dlq(str(e), raw=str(message.data[:500])))
+            Metrics.counter(_ns(self.domain), "parse_failures").inc()
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(self.domain, str(e), raw=str(message.data[:500])))
+            return
+        Metrics.counter(_ns(self.domain), "parse_ok").inc()
+        Metrics.distribution(_ns(self.domain), "message_bytes").update(len(message.data))
+        yield parsed
 
 
 class ValidateEvent(beam.DoFn):
@@ -187,37 +307,56 @@ class ValidateEvent(beam.DoFn):
     def process(self, event, *args, **kwargs):
         missing = self.envelope_required - event.keys()
         if missing:
-            yield beam.pvalue.TaggedOutput("dlq", _dlq(f"missing envelope fields: {missing}", event))
+            Metrics.counter(_ns(self.domain), "validate_failures").inc()
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(self.domain, f"missing envelope fields: {missing}", event))
             return
 
         event_domain = event.get("domain")
         if event_domain is not None and event_domain != self.domain:
+            Metrics.counter(_ns(self.domain), "validate_failures").inc()
             yield beam.pvalue.TaggedOutput("dlq", _dlq(
-                f"domain mismatch: expected {self.domain!r}, got {event_domain!r}", event
+                self.domain, f"domain mismatch: expected {self.domain!r}, got {event_domain!r}", event
             ))
             return
 
         payload = event.get("payload") or {}
-        payload_missing = self.payload_required - payload.keys()
-        if payload_missing:
-            yield beam.pvalue.TaggedOutput("dlq", _dlq(f"missing payload fields: {payload_missing}", event))
+        if not isinstance(payload, dict):
+            Metrics.counter(_ns(self.domain), "validate_failures").inc()
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(
+                self.domain, f"payload is not an object (got {type(payload).__name__})", event
+            ))
             return
 
+        payload_missing = self.payload_required - payload.keys()
+        if payload_missing:
+            Metrics.counter(_ns(self.domain), "validate_failures").inc()
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(self.domain, f"missing payload fields: {payload_missing}", event))
+            return
+
+        Metrics.counter(_ns(self.domain), "validate_ok").inc()
         yield event
 
 
 class EnrichEvent(beam.DoFn):
     """Stamp pipeline metadata onto each event before writing to BigQuery."""
 
-    def __init__(self, pipeline_version: str = "1.0"):
+    def __init__(self, pipeline_version: str = "1.0", domain: str = "unknown"):
         self.pipeline_version = pipeline_version
+        self.domain = domain
 
     def process(self, event, *args, **kwargs):
-        yield {
-            **event,
-            "ingested_at": datetime.now(timezone.utc).isoformat(),
-            "_pipeline_version": self.pipeline_version,
-        }
+        try:
+            enriched = {
+                **event,
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                "_pipeline_version": self.pipeline_version,
+            }
+        except Exception as e:
+            Metrics.counter(_ns(self.domain), "enrich_failures").inc()
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(self.domain, str(e), event if isinstance(event, dict) else None))
+            return
+        Metrics.counter(_ns(self.domain), "enrich_ok").inc()
+        yield enriched
 
 
 class StripInternalFields(beam.DoFn):
@@ -230,11 +369,161 @@ class StripInternalFields(beam.DoFn):
 class DetectAlerts(beam.DoFn):
     """Runs a windowed-aggregate dict through a domain's alert evaluator."""
 
-    def __init__(self, evaluator: Callable[[dict], list[dict]]):
+    def __init__(self, evaluator: Callable[[dict], list[dict]], domain: str = "unknown"):
         self.evaluator = evaluator
+        self.domain = domain
 
     def process(self, agg: dict, *args, **kwargs):
-        yield from self.evaluator(agg)
+        try:
+            alerts = list(self.evaluator(agg))
+        except Exception as e:
+            Metrics.counter(_ns(self.domain), "alert_failures").inc()
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(self.domain, str(e), agg if isinstance(agg, dict) else None))
+            return
+        Metrics.counter(_ns(self.domain), "alert_ok").inc()
+        Metrics.distribution(_ns(self.domain), "alerts_emitted").update(len(alerts))
+        yield from alerts
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Windowed aggregation (CombineFn-based — partial combining before the shuffle)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _zip_key(key: Any, key_field_names: Optional[tuple[str, ...]]) -> dict[str, Any]:
+    """Zips a DomainSpec.key_fn result onto its declared field names, e.g.
+    key=("a", "b"), key_field_names=("event_type", "channel") ->
+    {"event_type": "a", "channel": "b"}. Returns {} if key_field_names is
+    None (caller doesn't want the key fields reattached to the output row)."""
+    if key_field_names is None:
+        return {}
+    key_tuple = key if isinstance(key, tuple) else (key,)
+    return dict(zip(key_field_names, key_tuple))
+
+
+class KeyEvent(beam.DoFn):
+    """Keys an event by a domain's key_fn ahead of CombinePerKey. A key_fn
+    failure (e.g. reaching into a missing payload field) goes to the 'dlq'
+    tag instead of crashing the bundle."""
+
+    def __init__(self, key_fn: Callable[[dict], Any], domain: str):
+        self.key_fn = key_fn
+        self.domain = domain
+
+    def process(self, event, *args, **kwargs):
+        try:
+            key = self.key_fn(event)
+        except Exception as e:
+            Metrics.counter(_ns(self.domain), "key_failures").inc()
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(self.domain, str(e), event if isinstance(event, dict) else None))
+            return
+        Metrics.counter(_ns(self.domain), "key_ok").inc()
+        yield (key, event)
+
+
+class _DlqWrappingCombineFn(beam.CombineFn):
+    """Wraps a domain's CombineFn so a bad element can't crash the whole
+    aggregation bundle.
+
+    add_input/merge_accumulators have no side-output channel mid-combine —
+    an accumulator carries no per-event identity to attach to a DLQ row —
+    so a failure there can only be logged and the offending input/merge
+    dropped (the accumulator is returned unchanged, or for a failed merge,
+    the first accumulator in the batch is kept as a best-effort fallback).
+
+    extract_output failures instead produce a sentinel dict that
+    _AttachWindowAndKey recognizes and routes to the 'dlq' tag — this is the
+    one point in the chain where the aggregate result (not an individual
+    event) can still be captured.
+    """
+
+    def __init__(self, inner: "beam.CombineFn", domain: str):
+        self.inner = inner
+        self.domain = domain
+
+    def create_accumulator(self, *args, **kwargs):
+        return self.inner.create_accumulator(*args, **kwargs)
+
+    def add_input(self, accumulator, input, *args, **kwargs):
+        try:
+            result = self.inner.add_input(accumulator, input, *args, **kwargs)
+        except Exception:
+            logger.exception("%s: aggregate add_input failed, dropping element", self.domain)
+            Metrics.counter(_ns(self.domain), "aggregate_failures").inc()
+            return accumulator
+        Metrics.counter(_ns(self.domain), "aggregate_ok").inc()
+        return result
+
+    def merge_accumulators(self, accumulators, *args, **kwargs):
+        try:
+            return self.inner.merge_accumulators(accumulators, *args, **kwargs)
+        except Exception:
+            logger.exception("%s: aggregate merge_accumulators failed", self.domain)
+            Metrics.counter(_ns(self.domain), "aggregate_failures").inc()
+            accumulators = list(accumulators)
+            return accumulators[0] if accumulators else self.inner.create_accumulator()
+
+    def extract_output(self, accumulator, *args, **kwargs):
+        try:
+            return self.inner.extract_output(accumulator, *args, **kwargs)
+        except Exception as e:
+            Metrics.counter(_ns(self.domain), "aggregate_failures").inc()
+            return {"__agg_error__": True, "_error": str(e)}
+
+
+class _AttachWindowAndKey(beam.DoFn):
+    """Reattaches key and window fields to a CombinePerKey output row — a
+    CombineFn's extract_output has no access to either (Beam API
+    constraint: CombineFn methods must also work for non-keyed, non-windowed
+    combines), so the framework does it here instead of every domain
+    hand-rolling it. Routes _DlqWrappingCombineFn's error sentinel to the
+    'dlq' tag."""
+
+    def __init__(self, key_field_names: Optional[tuple[str, ...]], domain: str):
+        self.key_field_names = key_field_names
+        self.domain = domain
+
+    def process(self, kv, window=beam.DoFn.WindowParam, *args, **kwargs):
+        key, agg = kv
+        if isinstance(agg, dict) and agg.get("__agg_error__"):
+            yield beam.pvalue.TaggedOutput("dlq", _dlq(
+                self.domain, agg.get("_error", "aggregate error"), None, **_zip_key(key, self.key_field_names)
+            ))
+            return
+        Metrics.counter(_ns(self.domain), "aggregate_rows_ok").inc()
+        yield {
+            **agg,
+            **_zip_key(key, self.key_field_names),
+            "window_start": window.start.to_utc_datetime().isoformat(),
+            "window_end": window.end.to_utc_datetime().isoformat(),
+        }
+
+
+def _window_transform(spec: "DomainSpec", window_secs: int) -> "beam.WindowInto":
+    """Builds the WindowInto transform for a domain's aggregation. With no
+    lateness/early-firing config (the default), this is the exact
+    zero-kwargs FixedWindows call the framework has always made — behavior
+    is bit-for-bit unchanged for callers who don't opt in. Otherwise adds a
+    trigger for early/speculative firing and the configured allowed
+    lateness; Beam's default trigger already re-fires per late element once
+    allowed_lateness > 0, so no separate late-firing-cadence knob is needed.
+    """
+    if spec.early_firing_secs is None and spec.allowed_lateness_secs == 0:
+        return beam.WindowInto(FixedWindows(window_secs))
+
+    trigger = None
+    if spec.early_firing_secs is not None:
+        trigger = AfterWatermark(early=AfterProcessingTime(spec.early_firing_secs))
+
+    return beam.WindowInto(
+        FixedWindows(window_secs),
+        trigger=trigger,
+        accumulation_mode=(
+            AccumulationMode.DISCARDING
+            if spec.accumulation_mode == "discarding"
+            else AccumulationMode.ACCUMULATING
+        ),
+        allowed_lateness=spec.allowed_lateness_secs,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -248,13 +537,26 @@ def build_streaming_pipeline(
     options: "PipelineOptions",
     window_secs: int = DEFAULT_WINDOW_SECS,
     pipeline_version: str = "1.0",
+    write_method: str = "STORAGE_WRITE_API",
+    triggering_frequency_secs: int = 5,
+    use_storage_api_auto_sharding: bool = True,
 ) -> None:
     """
     Wires one Beam pipeline covering every domain in `domains`. Each domain
-    gets its own read → parse → validate → enrich → write-raw branch, plus
-    (if configured) a windowed aggregate → write-enriched → alert branch.
+    gets its own read → parse → (dedup) → validate → enrich → write-raw
+    branch, plus (if configured) a windowed aggregate → write-enriched →
+    alert branch.
 
     `alerts_table` is required if any domain sets an `alert_evaluator`.
+
+    `write_method` defaults to the BigQuery Storage Write API rather than
+    legacy streaming inserts: higher throughput, cheaper, and — combined
+    with `DomainSpec.dedup_key_fn` — the practical way to get exactly-once
+    rows out of an at-least-once source like Pub/Sub. `use_at_least_once`
+    is left at Beam's default (False), i.e. exactly-once write semantics.
+    `triggering_frequency_secs` controls how often batches commit; lower is
+    lower-latency, higher is fewer/cheaper API calls. Pass
+    `write_method="STREAMING_INSERTS"` to opt back into the legacy sink.
     """
     if any(d.alert_evaluator for d in domains) and not alerts_table:
         raise ValueError("alerts_table is required when any domain has an alert_evaluator")
@@ -262,7 +564,11 @@ def build_streaming_pipeline(
     write_cfg: dict[str, Any] = dict(
         create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
         write_disposition=BigQueryDisposition.WRITE_APPEND,
+        method=write_method,
     )
+    if write_method == "STORAGE_WRITE_API":
+        write_cfg["triggering_frequency"] = triggering_frequency_secs
+        write_cfg["with_auto_sharding"] = use_storage_api_auto_sharding
 
     with beam.Pipeline(options=options) as p:
         for spec in domains:
@@ -272,46 +578,70 @@ def build_streaming_pipeline(
                 topic=topic_path, with_attributes=True
             )
             parsed = raw | f"{spec.name}_Parse" >> beam.ParDo(
-                ParseMessage()
+                ParseMessage(spec.name)
             ).with_outputs("dlq", main="ok")
-            valid = parsed.ok | f"{spec.name}_Validate" >> beam.ParDo(
+
+            to_validate = parsed.ok
+            if spec.dedup_key_fn:
+                to_validate = (
+                    parsed.ok
+                    | f"{spec.name}_DedupKey" >> beam.Map(lambda e, kf=spec.dedup_key_fn: (kf(e), e))
+                    | f"{spec.name}_Dedup" >> DeduplicatePerKey(
+                        processing_time_duration=spec.dedup_window_secs
+                    )
+                    | f"{spec.name}_DedupUnkey" >> beam.Map(lambda kv: kv[1])
+                )
+
+            valid = to_validate | f"{spec.name}_Validate" >> beam.ParDo(
                 ValidateEvent(spec.name, spec.envelope_required, spec.payload_required)
             ).with_outputs("dlq", main="ok")
             enriched = valid.ok | f"{spec.name}_Enrich" >> beam.ParDo(
-                EnrichEvent(pipeline_version)
-            )
-            clean = enriched | f"{spec.name}_Strip" >> beam.ParDo(StripInternalFields())
+                EnrichEvent(pipeline_version, spec.name)
+            ).with_outputs("dlq", main="ok")
+            clean = enriched.ok | f"{spec.name}_Strip" >> beam.ParDo(StripInternalFields())
 
             clean | f"{spec.name}_WriteRaw" >> WriteToBigQuery(
                 f"{project}:{spec.raw_table}", **write_cfg
             )
 
-            if spec.dlq_table:
-                dlq = (
-                    (parsed.dlq, valid.dlq)
-                    | f"{spec.name}_DlqFlatten" >> beam.Flatten()
-                )
-                dlq | f"{spec.name}_WriteDlq" >> WriteToBigQuery(
-                    f"{project}:{spec.dlq_table}", **write_cfg
-                )
-
+            keyed = None
+            agg = None
+            alerts = None
             if spec.enriched_table:
-                agg = (
-                    enriched
-                    | f"{spec.name}_Window" >> beam.WindowInto(FixedWindows(window_secs))
-                    | f"{spec.name}_KV" >> beam.Map(lambda e, kf=spec.key_fn: (kf(e), e))
-                    | f"{spec.name}_Group" >> beam.GroupByKey()
-                    | f"{spec.name}_Agg" >> beam.ParDo(spec.aggregate_fn())
+                keyed = (
+                    enriched.ok
+                    | f"{spec.name}_Window" >> _window_transform(spec, window_secs)
+                    | f"{spec.name}_KV" >> beam.ParDo(
+                        KeyEvent(spec.key_fn, spec.name)
+                    ).with_outputs("dlq", main="ok")
                 )
-                agg | f"{spec.name}_WriteAgg" >> WriteToBigQuery(
+                combined = keyed.ok | f"{spec.name}_Combine" >> beam.CombinePerKey(
+                    _DlqWrappingCombineFn(spec.aggregate_fn(), spec.name)
+                )
+                agg = combined | f"{spec.name}_AttachKeyWindow" >> beam.ParDo(
+                    _AttachWindowAndKey(spec.key_field_names, spec.name)
+                ).with_outputs("dlq", main="ok")
+                agg.ok | f"{spec.name}_WriteAgg" >> WriteToBigQuery(
                     f"{project}:{spec.enriched_table}", **write_cfg
                 )
 
                 if spec.alert_evaluator:
-                    (
-                        agg
-                        | f"{spec.name}_Alerts" >> beam.ParDo(DetectAlerts(spec.alert_evaluator))
-                        | f"{spec.name}_WriteAlerts" >> WriteToBigQuery(
-                            f"{project}:{alerts_table}", **write_cfg
-                        )
+                    alerts = agg.ok | f"{spec.name}_Alerts" >> beam.ParDo(
+                        DetectAlerts(spec.alert_evaluator, spec.name)
+                    ).with_outputs("dlq", main="ok")
+                    alerts.ok | f"{spec.name}_WriteAlerts" >> WriteToBigQuery(
+                        f"{project}:{alerts_table}", **write_cfg
                     )
+
+            if spec.dlq_table:
+                dlq_branches = [parsed.dlq, valid.dlq, enriched.dlq]
+                if keyed is not None:
+                    dlq_branches.append(keyed.dlq)
+                if agg is not None:
+                    dlq_branches.append(agg.dlq)
+                if alerts is not None:
+                    dlq_branches.append(alerts.dlq)
+                dlq = tuple(dlq_branches) | f"{spec.name}_DlqFlatten" >> beam.Flatten()
+                dlq | f"{spec.name}_WriteDlq" >> WriteToBigQuery(
+                    f"{project}:{spec.dlq_table}", **write_cfg
+                )

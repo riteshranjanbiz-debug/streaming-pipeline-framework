@@ -42,34 +42,41 @@ def order_key(event: dict) -> tuple:
     )
 
 
-class AggregateOrderWindow(beam.DoFn):
-    """Key: (event_type, channel, region). Output: one row per window/key."""
+class AggregateOrderWindow(beam.CombineFn):
+    """Key: (event_type, channel, region) — reattached to the output row by
+    the framework (see DomainSpec.key_field_names on ORDERS_DOMAIN below), not
+    by this class. A CombineFn's methods never see the grouping key, so
+    window/key fields can't be attached here even if we wanted to."""
 
-    def process(self, element, window=beam.DoFn.WindowParam):
-        key, events = element
-        event_type, channel, region = key
-        events = list(events)
-
-        total_value = sum((e.get("payload") or {}).get("order_total") or 0 for e in events)
-        cancelled = sum(1 for e in events if e.get("event_type") == "order.cancelled")
-        refunded = sum(
-            (e.get("payload") or {}).get("order_total") or 0
-            for e in events
-            if e.get("event_type") == "order.refunded"
-        )
-
-        yield {
-            "window_start": window.start.to_utc_datetime().isoformat(),
-            "window_end": window.end.to_utc_datetime().isoformat(),
-            "event_type": event_type,
-            "channel": channel,
-            "region": region,
-            "event_count": len(events),
-            "total_order_value": total_value,
-            "cancelled_count": cancelled,
-            "refunded_amount": refunded,
-            "computed_at": datetime.now(timezone.utc).isoformat(),
+    def create_accumulator(self):
+        return {
+            "event_count": 0,
+            "total_order_value": 0.0,
+            "cancelled_count": 0,
+            "refunded_amount": 0.0,
         }
+
+    def add_input(self, accumulator, event):
+        order_total = (event.get("payload") or {}).get("order_total") or 0
+        accumulator["event_count"] += 1
+        accumulator["total_order_value"] += order_total
+        if event.get("event_type") == "order.cancelled":
+            accumulator["cancelled_count"] += 1
+        if event.get("event_type") == "order.refunded":
+            accumulator["refunded_amount"] += order_total
+        return accumulator
+
+    def merge_accumulators(self, accumulators):
+        merged = self.create_accumulator()
+        for acc in accumulators:
+            merged["event_count"] += acc["event_count"]
+            merged["total_order_value"] += acc["total_order_value"]
+            merged["cancelled_count"] += acc["cancelled_count"]
+            merged["refunded_amount"] += acc["refunded_amount"]
+        return merged
+
+    def extract_output(self, accumulator):
+        return {**accumulator, "computed_at": datetime.now(timezone.utc).isoformat()}
 
 
 def _alert(alert_type: str, severity: str, agg: dict[str, Any],
@@ -126,6 +133,7 @@ ORDERS_DOMAIN = DomainSpec(
     enriched_table="enriched.order_summary_5min",
     key_fn=order_key,
     aggregate_fn=AggregateOrderWindow,
+    key_field_names=("event_type", "channel", "region"),
     alert_evaluator=evaluate_order_alerts,
 )
 

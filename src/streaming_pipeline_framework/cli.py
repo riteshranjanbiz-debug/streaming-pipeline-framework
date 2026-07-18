@@ -37,6 +37,8 @@ def main(
     window_secs: int = 300,
     pipeline_version: str = "1.0",
     incident_notifier: IncidentNotifier | None = None,
+    write_method: str = "STORAGE_WRITE_API",
+    triggering_frequency_secs: int = 5,
 ) -> None:
     """
     Parse standard CLI args and run `build_streaming_pipeline`.
@@ -44,6 +46,10 @@ def main(
     `incident_notifier`: optional (e.g. a `ServiceNowClient`). If given, any
     uncaught exception during pipeline execution creates an incident before
     re-raising — see `health.run_with_incident_on_failure`. Omit to disable.
+
+    `write_method`/`triggering_frequency_secs`: see
+    `build_streaming_pipeline`'s docstring — defaults to the BigQuery
+    Storage Write API (exactly-once), not legacy streaming inserts.
     """
     parser = build_arg_parser(description)
     args, beam_args = parser.parse_known_args()
@@ -70,6 +76,8 @@ def main(
             options,
             window_secs=window_secs,
             pipeline_version=pipeline_version,
+            write_method=write_method,
+            triggering_frequency_secs=triggering_frequency_secs,
         )
 
     run_with_incident_on_failure(
