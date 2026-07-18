@@ -104,6 +104,18 @@ without running anything):
 python -m examples.retail_orders.pipeline --project <gcp-project> --runner DirectRunner
 ```
 
+For `DataflowRunner`, `examples/retail_orders/terraform/` provisions everything
+the example needs on GCP — the Pub/Sub topic, the `raw`/`enriched` BigQuery
+datasets and tables (including a schema for `raw.order_events_dlq`), a Dataflow
+worker service account with the right IAM roles, and the GCS temp bucket:
+
+```bash
+cd examples/retail_orders/terraform
+terraform init
+terraform apply -var="project_id=<gcp-project>"
+terraform output run_command   # ready-to-run DataflowRunner invocation
+```
+
 ## Incident creation on pipeline failure
 
 Two independent, opt-in triggers, both in `health.py`, both accepting any
