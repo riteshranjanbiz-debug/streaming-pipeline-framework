@@ -1,5 +1,6 @@
 from .framework import (
     DomainSpec,
+    InactivityDetector,
     ParseMessage,
     ValidateEvent,
     EnrichEvent,
@@ -22,6 +23,7 @@ from .health import (
 
 __all__ = [
     "DomainSpec",
+    "InactivityDetector",
     "ParseMessage",
     "ValidateEvent",
     "EnrichEvent",

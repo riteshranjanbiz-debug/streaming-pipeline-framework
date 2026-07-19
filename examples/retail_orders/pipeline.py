@@ -6,11 +6,14 @@ insurance use case the framework was extracted from. Swap in your own
 DomainSpec, aggregator, and alert rules the same way.
 
 Models a retail funnel, not just completed orders: cart.item_added,
-cart.item_removed, cart.abandoned, order.created, order.cancelled,
-order.refunded. All six share the same envelope/payload shape — for cart
-events, payload.order_id doubles as a cart/session identifier and
-payload.order_total as the cart's value at that point (0 is fine for
-removal/abandonment events that don't carry a meaningful total).
+cart.item_removed, order.created, order.cancelled, order.refunded — and
+cart.abandoned, which no real storefront ever actually fires. Abandonment
+is *inferred*: CART_INACTIVITY_DETECTOR watches each customer_id, and if
+20 minutes pass with items still in their cart and no further event, it
+synthesizes a cart.abandoned event and injects it back into the same
+stream (see DomainSpec.inactivity_detector / InactivityDetector in
+framework.py). AggregateOrderWindow/AggregateCustomer360 treat it exactly
+like any other event — they don't know or care it was synthesized.
 
 Two DomainSpecs consume the same "order-events" topic: ORDERS_DOMAIN (the
 operational (channel, region) view above) and CUSTOMER_360_DOMAIN (a
@@ -36,11 +39,12 @@ Deploy to Dataflow:
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from streaming_pipeline_framework import DomainSpec, beam
+from streaming_pipeline_framework import DomainSpec, InactivityDetector, beam
 from streaming_pipeline_framework.cli import main as cli_main
 
 ENVELOPE_REQUIRED = frozenset(
@@ -51,6 +55,12 @@ PAYLOAD_REQUIRED = frozenset({"order_id", "channel", "region", "order_total", "c
 CANCELLATION_RATE_THRESHOLD = 0.15
 REFUND_SPIKE_THRESHOLD = 5_000.0
 CART_ABANDONMENT_RATE_THRESHOLD = 0.50
+
+# 20 minutes of real inactivity, per the module docstring. Overridable via
+# env var so a short-lived test run can actually observe a timeout firing
+# without waiting 20 real minutes — e.g.
+# CART_ABANDONMENT_TIMEOUT_SECS=20 python -m examples.retail_orders.pipeline ...
+CART_ABANDONMENT_TIMEOUT_SECS = int(os.environ.get("CART_ABANDONMENT_TIMEOUT_SECS", 1200))
 
 # BigQuery schemas — required because write_method defaults to
 # STORAGE_WRITE_API, which (unlike legacy streaming inserts) needs field
@@ -282,6 +292,63 @@ class AggregateCustomer360(beam.CombineFn):
         return {**accumulator, "computed_at": datetime.now(timezone.utc).isoformat()}
 
 
+def _cart_state_reducer(state: dict | None, event: dict) -> dict:
+    """Tracks net cart size + last known channel/region per customer_id.
+    Must return a new dict, not mutate `state` in place — same rule as a
+    CombineFn accumulator (see InactivityDetector's docstring)."""
+    state = dict(state) if state else {"cart_items": 0, "channel": None, "region": None}
+    payload = event.get("payload") or {}
+    state["channel"] = payload.get("channel") or state["channel"]
+    state["region"] = payload.get("region") or state["region"]
+    event_type = event.get("event_type")
+    if event_type == "cart.item_added":
+        state["cart_items"] += 1
+    elif event_type == "cart.item_removed":
+        state["cart_items"] = max(0, state["cart_items"] - 1)
+    elif event_type == "order.created":
+        state["cart_items"] = 0  # checked out — cart cleared, nothing to abandon
+    return state
+
+
+def _cart_is_pending(state: dict | None) -> bool:
+    return bool(state) and state.get("cart_items", 0) > 0
+
+
+def _cart_abandoned_event(key: Any, state: dict) -> dict:
+    customer_id = key[0] if isinstance(key, tuple) else key
+    return {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "cart.abandoned",
+        "source_system": "inactivity-detector",
+        "domain": "orders",
+        "public_id": f"PUB-{uuid.uuid4().hex[:8]}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "payload": {
+            "order_id": f"ORD-{uuid.uuid4().hex[:8]}",
+            "channel": state.get("channel") or "unknown",
+            "region": state.get("region") or "unknown",
+            "order_total": 0.0,
+            "customer_id": customer_id,
+        },
+    }
+
+
+# Shared by both ORDERS_DOMAIN and CUSTOMER_360_DOMAIN below — each domain
+# independently reads the same topic (see DomainSpec.enforce_domain_match's
+# docstring), so each needs its own copy of this detector wired in to see
+# synthetic cart.abandoned events in its own aggregation. Keyed by
+# customer_id, not either domain's own aggregation key — cart abandonment
+# is fundamentally a per-customer/session concept.
+CART_INACTIVITY_DETECTOR = InactivityDetector(
+    key_fn=lambda e: (e.get("payload") or {}).get("customer_id", "unknown"),
+    timeout_secs=CART_ABANDONMENT_TIMEOUT_SECS,
+    reducer_fn=_cart_state_reducer,
+    should_fire_fn=_cart_is_pending,
+    timeout_event_fn=_cart_abandoned_event,
+    initial_state_fn=lambda: {"cart_items": 0, "channel": None, "region": None},
+)
+
+
 def _alert(alert_type: str, severity: str, agg: dict[str, Any],
            metric_name: str, metric_value: float, threshold: float) -> dict[str, Any]:
     return {
@@ -342,6 +409,7 @@ ORDERS_DOMAIN = DomainSpec(
     raw_table_schema=ORDER_EVENTS_SCHEMA,
     envelope_required=ENVELOPE_REQUIRED,
     payload_required=PAYLOAD_REQUIRED,
+    inactivity_detector=CART_INACTIVITY_DETECTOR,
     dlq_table="raw.order_events_dlq",  # malformed/invalid events land here, not silently dropped
     enriched_table="enriched.order_summary_5min",
     enriched_table_schema=ORDER_SUMMARY_SCHEMA,
@@ -365,6 +433,7 @@ CUSTOMER_360_DOMAIN = DomainSpec(
     envelope_required=ENVELOPE_REQUIRED,
     payload_required=PAYLOAD_REQUIRED,
     enforce_domain_match=False,
+    inactivity_detector=CART_INACTIVITY_DETECTOR,
     enriched_table="enriched.customer_360",
     enriched_table_schema=CUSTOMER_360_SCHEMA,
     key_fn=customer_key,

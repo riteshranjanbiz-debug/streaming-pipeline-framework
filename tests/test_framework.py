@@ -28,6 +28,8 @@ from streaming_pipeline_framework.framework import (
     build_streaming_pipeline,
     _coerce_timestamps_for_schema,
     BEAM_AVAILABLE,
+    InactivityDetector,
+    _InactivityWatcher,
 )
 
 
@@ -555,3 +557,134 @@ class TestCoerceTimestampsForSchema:
                "payload": {"order_total": 9.99, "placed_at": None}}
         out = _coerce_timestamps_for_schema(row, self.SCHEMA)
         assert type(out["ingested_at"]).__name__ == "Timestamp"
+
+
+# ── InactivityDetector / _InactivityWatcher ─────────────────────────────────
+# _InactivityWatcher relies on Timestamp.now() + timeout_secs (processing
+# time) to schedule its timer — the same pattern this framework's own
+# DeduplicatePerKey usage relies on (see apache_beam.transforms.deduplicate).
+# That only reliably fires against real wall-clock time in a running
+# pipeline, not in a bounded/TestStream unit test, so — like every other
+# DoFn in this module — these tests call .process()/on_timer directly with
+# fake state/timer objects rather than exercising a real Beam pipeline.
+
+class _FakeState:
+    def __init__(self, initial=None):
+        self.value = initial
+
+    def read(self):
+        return self.value
+
+    def write(self, value):
+        self.value = value
+
+    def clear(self):
+        self.value = None
+
+
+class _FakeTimer:
+    def __init__(self):
+        self.set_to = None
+        self.cleared = False
+
+    def set(self, timestamp):
+        self.set_to = timestamp
+        self.cleared = False
+
+    def clear(self):
+        self.cleared = True
+        self.set_to = None
+
+
+def _cart_detector(timeout_secs=1200):
+    """A minimal cart-like detector: state is a plain int (item count)."""
+    return InactivityDetector(
+        key_fn=lambda e: e["customer_id"],
+        timeout_secs=timeout_secs,
+        reducer_fn=lambda state, event: (state or 0) + (1 if event.get("add") else -1),
+        should_fire_fn=lambda state: (state or 0) > 0,
+        timeout_event_fn=lambda key, state: {"event_type": "timeout", "customer_id": key, "items": state},
+        initial_state_fn=lambda: 0,
+    )
+
+
+@pytest.mark.skipif(not BEAM_AVAILABLE, reason="needs real apache_beam.utils.timestamp.Timestamp")
+class TestInactivityWatcher:
+    def test_process_sets_timer_when_pending(self):
+        watcher = _InactivityWatcher(_cart_detector(), "widgets")
+        state, timer = _FakeState(), _FakeTimer()
+        result = list(watcher.process(("cust-1", {"add": True}), state=state, timer=timer))
+        assert result == [{"add": True}]  # passthrough unchanged
+        assert state.value == 1
+        assert timer.set_to is not None
+        assert not timer.cleared
+
+    def test_process_clears_timer_when_resolved(self):
+        watcher = _InactivityWatcher(_cart_detector(), "widgets")
+        state, timer = _FakeState(initial=1), _FakeTimer()
+        result = list(watcher.process(("cust-1", {"add": False}), state=state, timer=timer))
+        assert result == [{"add": False}]
+        assert state.value == 0
+        assert timer.cleared
+
+    def test_process_failure_still_yields_passthrough(self):
+        detector = InactivityDetector(
+            key_fn=lambda e: e["customer_id"],
+            timeout_secs=60,
+            reducer_fn=lambda state, event: 1 / 0,  # broken on purpose
+            should_fire_fn=lambda state: True,
+            timeout_event_fn=lambda key, state: {},
+        )
+        watcher = _InactivityWatcher(detector, "widgets")
+        state, timer = _FakeState(), _FakeTimer()
+        result = list(watcher.process(("cust-1", {"event": "x"}), state=state, timer=timer))
+        assert result == [{"event": "x"}]  # the real event still gets through
+
+    def test_on_timeout_yields_synthetic_event_and_clears_state(self):
+        watcher = _InactivityWatcher(_cart_detector(), "widgets")
+        state = _FakeState(initial=2)
+        results = list(watcher._on_timeout(key="cust-1", state=state))
+        assert len(results) == 1
+        assert isinstance(results[0], _TaggedOutput)
+        assert results[0].tag == "timeout"
+        assert results[0].value == {"event_type": "timeout", "customer_id": "cust-1", "items": 2}
+        assert state.value is None
+
+    def test_on_timeout_no_op_when_already_resolved(self):
+        watcher = _InactivityWatcher(_cart_detector(), "widgets")
+        state = _FakeState(initial=0)  # cart emptied before timer fired
+        results = list(watcher._on_timeout(key="cust-1", state=state))
+        assert results == []
+
+    def test_on_timeout_no_op_when_state_is_none(self):
+        watcher = _InactivityWatcher(_cart_detector(), "widgets")
+        state = _FakeState(initial=None)
+        results = list(watcher._on_timeout(key="cust-1", state=state))
+        assert results == []
+
+    def test_on_timeout_failure_in_timeout_event_fn_does_not_crash(self):
+        detector = InactivityDetector(
+            key_fn=lambda e: e["customer_id"],
+            timeout_secs=60,
+            reducer_fn=lambda state, event: 1,
+            should_fire_fn=lambda state: True,
+            timeout_event_fn=lambda key, state: 1 / 0,  # broken on purpose
+        )
+        watcher = _InactivityWatcher(detector, "widgets")
+        state = _FakeState(initial=1)
+        results = list(watcher._on_timeout(key="cust-1", state=state))
+        assert results == []
+
+
+class TestDomainSpecInactivityDetector:
+    def test_defaults_to_none(self):
+        spec = DomainSpec(name="widgets", topic="widget-events", raw_table="raw.widgets")
+        assert spec.inactivity_detector is None
+
+    def test_can_be_set(self):
+        detector = _cart_detector()
+        spec = DomainSpec(
+            name="widgets", topic="widget-events", raw_table="raw.widgets",
+            inactivity_detector=detector,
+        )
+        assert spec.inactivity_detector is detector

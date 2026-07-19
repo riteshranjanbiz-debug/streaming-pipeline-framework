@@ -36,6 +36,9 @@ try:
     from apache_beam.transforms.trigger import AccumulationMode, AfterProcessingTime, AfterWatermark
     from apache_beam.metrics import Metrics
     from apache_beam.utils.timestamp import Timestamp
+    from apache_beam.transforms.userstate import ReadModifyWriteStateSpec, TimerSpec, on_timer
+    from apache_beam.transforms.timeutil import TimeDomain
+    from apache_beam.coders import PickleCoder
 
     _TaggedOutput = beam.pvalue.TaggedOutput
     BEAM_AVAILABLE = True
@@ -52,6 +55,9 @@ except ImportError:
 
     class _DoFn:
         WindowParam = None
+        StateParam = staticmethod(lambda spec: None)
+        TimerParam = staticmethod(lambda spec: None)
+        KeyParam = None
 
         def process(self, element: Any, *args: Any, **kwargs: Any):  # type: ignore[empty-body]
             ...
@@ -93,6 +99,26 @@ except ImportError:
     AfterWatermark = None  # type: ignore[assignment]
     Timestamp = None  # type: ignore[assignment]
 
+    class ReadModifyWriteStateSpec:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+    class TimerSpec:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+    def on_timer(spec: Any):  # type: ignore[no-redef]
+        def decorator(fn):
+            return fn
+        return decorator
+
+    class TimeDomain:  # type: ignore[no-redef]
+        REAL_TIME = "REAL_TIME"
+
+    class PickleCoder:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_WINDOW_SECS = 300  # 5 minutes
@@ -101,6 +127,58 @@ DEFAULT_WINDOW_SECS = 300  # 5 minutes
 # ═══════════════════════════════════════════════════════════════════════════════
 # Domain contract
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class InactivityDetector:
+    """
+    Generic "flag this key as timed out if silent for N seconds" building
+    block — set on `DomainSpec.inactivity_detector` when a domain needs to
+    *infer* a state transition from the absence of events, not from an
+    explicit one. E.g. a real storefront never emits "cart abandoned" —
+    that's inferred when a customer with items in their cart goes quiet for
+    20 minutes. Same shape applies elsewhere: a stalled shipment (no status
+    update for N hours), an idle support ticket, a missed IoT heartbeat.
+
+    Implemented as a stateful `DoFn` with a per-key processing-time timer
+    (see `_InactivityWatcher`): every event for a key resets the timer:
+    if it fires before the next event arrives, `timeout_event_fn` is called
+    to synthesize an event, injected back into the same stream as if it had
+    arrived for real — so it flows through Enrich, the raw write, and
+    aggregation identically to a genuine event, with no special-casing
+    anywhere downstream.
+
+      key_fn              dict -> key to track inactivity per (e.g. a
+                          customer/session id) — usually different from a
+                          domain's aggregation `key_fn`.
+      timeout_secs         how long a key can go silent before firing.
+      reducer_fn            (state, event) -> new state. Called for every
+                          event on this key; tracks whatever domain-specific
+                          "pending" condition matters (e.g. net cart item
+                          count). Must return a new value, not mutate
+                          `state` in place — same rule as a `CombineFn`
+                          accumulator.
+      should_fire_fn         state -> bool. Whether a timeout should
+                          actually produce a synthetic event (e.g. cart
+                          non-empty) — checked both when (re)scheduling the
+                          timer and when it fires, so a key that resolved
+                          itself (checked out, cart emptied) before timing
+                          out never fires.
+      timeout_event_fn       (key, state) -> a full event dict, shaped like
+                          any other event this domain validates (all of
+                          envelope_required/payload_required present) —
+                          it re-enters the pipeline at the same point a real
+                          event would.
+      initial_state_fn       zero-arg factory for a key's state before its
+                          first event (default: `lambda: None`).
+    """
+
+    key_fn: Callable[[dict], Any]
+    timeout_secs: int
+    reducer_fn: Callable[[Any, dict], Any]
+    should_fire_fn: Callable[[Any], bool]
+    timeout_event_fn: Callable[[Any, Any], dict]
+    initial_state_fn: Callable[[], Any] = lambda: None
+
 
 @dataclass(frozen=True)
 class DomainSpec:
@@ -143,6 +221,12 @@ class DomainSpec:
                            pipeline) but the events' own `domain` field is
                            still the shared stream's single value, so the
                            mismatch check would otherwise reject everything.
+      inactivity_detector    optional `InactivityDetector` (see its own
+                           docstring) — synthesizes and injects an event
+                           when a key goes silent for a configured timeout,
+                           for state that's inferred from absence rather
+                           than announced by an explicit event (e.g. cart
+                           abandonment). Runs between Validate and Enrich.
 
     Windowed aggregation (all three required together, or all omitted):
       enriched_table      "dataset.table" for the windowed aggregate rows
@@ -240,6 +324,7 @@ class DomainSpec:
     envelope_required: frozenset[str] = field(default_factory=frozenset)
     payload_required: frozenset[str] = field(default_factory=frozenset)
     enforce_domain_match: bool = True
+    inactivity_detector: Optional["InactivityDetector"] = None
     enriched_table: Optional[str] = None
     key_fn: Optional[Callable[[dict], Any]] = None
     aggregate_fn: Optional[Callable[[], Any]] = None
@@ -443,6 +528,81 @@ class DetectAlerts(beam.DoFn):
         Metrics.counter(_ns(self.domain), "alert_ok").inc()
         Metrics.distribution(_ns(self.domain), "alerts_emitted").update(len(alerts))
         yield from alerts
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inactivity detection (see InactivityDetector's docstring)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_INACTIVITY_STATE = ReadModifyWriteStateSpec("inactivity_state", PickleCoder())
+_INACTIVITY_TIMER = TimerSpec("inactivity_timer", TimeDomain.REAL_TIME)
+
+
+class _InactivityWatcher(beam.DoFn):
+    """Stateful per-key watcher backing `InactivityDetector`. Every event
+    resets the timer via `detector.reducer_fn`; if `detector.should_fire_fn`
+    is false after reducing (the domain's own "no longer pending" signal,
+    e.g. checkout clearing a cart), the timer is cleared instead — so a key
+    that resolved itself never fires. `Timestamp.now() + timeout_secs`
+    (processing time) is the same pattern this framework's own
+    `DeduplicatePerKey` usage relies on — see apache_beam.transforms.
+    deduplicate.DeduplicatePerKey for the canonical example. This means it
+    only reliably fires against real wall-clock time in a running pipeline,
+    not in a bounded/TestStream unit test — this class's own tests call
+    `.process()`/its `on_timer` method directly instead, same as every
+    other DoFn in this module."""
+
+    def __init__(self, detector: "InactivityDetector", domain: str):
+        self.detector = detector
+        self.domain = domain
+
+    def process(
+        self,
+        kv,
+        state=beam.DoFn.StateParam(_INACTIVITY_STATE),
+        timer=beam.DoFn.TimerParam(_INACTIVITY_TIMER),
+    ):
+        _, event = kv
+        try:
+            current = state.read()
+            if current is None:
+                current = self.detector.initial_state_fn()
+            new_state = self.detector.reducer_fn(current, event)
+            state.write(new_state)
+            if self.detector.should_fire_fn(new_state):
+                timer.set(Timestamp.now() + self.detector.timeout_secs)
+            else:
+                timer.clear()
+        except Exception:
+            # A broken reducer_fn/should_fire_fn shouldn't crash the whole
+            # bundle or block the real event from reaching downstream
+            # stages — log and leave this key's state/timer untouched
+            # rather than risk repeatedly firing on bad state.
+            logger.exception("%s: inactivity reducer/should_fire_fn failed", self.domain)
+        yield event
+
+    @on_timer(_INACTIVITY_TIMER)
+    def _on_timeout(
+        self,
+        key=beam.DoFn.KeyParam,
+        state=beam.DoFn.StateParam(_INACTIVITY_STATE),
+    ):
+        current = state.read()
+        try:
+            should_fire = current is not None and self.detector.should_fire_fn(current)
+        except Exception:
+            logger.exception("%s: inactivity should_fire_fn failed on timeout", self.domain)
+            return
+        if not should_fire:
+            return
+        try:
+            timeout_event = self.detector.timeout_event_fn(key, current)
+        except Exception:
+            logger.exception("%s: inactivity timeout_event_fn failed", self.domain)
+            return
+        Metrics.counter(_ns(self.domain), "inactivity_timeouts").inc()
+        yield beam.pvalue.TaggedOutput("timeout", timeout_event)
+        state.clear()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -763,7 +923,21 @@ def build_streaming_pipeline(
             valid = to_validate | f"{spec.name}_Validate" >> beam.ParDo(
                 ValidateEvent(spec.name, spec.envelope_required, spec.payload_required, spec.enforce_domain_match)
             ).with_outputs("dlq", main="ok")
-            enriched = valid.ok | f"{spec.name}_Enrich" >> beam.ParDo(
+
+            to_enrich = valid.ok
+            if spec.inactivity_detector:
+                watched = (
+                    valid.ok
+                    | f"{spec.name}_InactivityKey" >> beam.Map(
+                        lambda e, kf=spec.inactivity_detector.key_fn: (kf(e), e)
+                    )
+                    | f"{spec.name}_InactivityWatch" >> beam.ParDo(
+                        _InactivityWatcher(spec.inactivity_detector, spec.name)
+                    ).with_outputs("timeout", main="ok")
+                )
+                to_enrich = (watched.ok, watched.timeout) | f"{spec.name}_InactivityFlatten" >> beam.Flatten()
+
+            enriched = to_enrich | f"{spec.name}_Enrich" >> beam.ParDo(
                 EnrichEvent(pipeline_version, spec.name)
             ).with_outputs("dlq", main="ok")
 

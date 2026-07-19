@@ -3,8 +3,14 @@ Simulates N concurrent shoppers, each a persistent customer_id moving
 through a real funnel over time — not independent random events:
 
   IDLE -> (start session, pick channel/region) -> IN_CART
-  IN_CART -> add item | remove item | abandon cart -> IDLE | checkout -> DONE
+  IN_CART -> add item | remove item | checkout -> DONE | go quiet -> STALLED
+  STALLED -> (after a while, no event fired) -> IDLE
   DONE -> (maybe) cancel | refund shortly after purchase -> IDLE
+
+Deliberately does NOT publish a "cart.abandoned" event — no real storefront
+ever fires one. A shopper who "abandons" just stops acting (STALLED, no
+event) for a while; the pipeline's CART_INACTIVITY_DETECTOR is what infers
+abandonment from that silence (see pipeline.py's module docstring).
 
 Every event a given customer publishes during a session carries the same
 customer_id/channel/region, so enriched.customer_360 (keyed by customer_id)
@@ -18,6 +24,13 @@ itself requires.
 Usage:
   python -m examples.retail_orders.simulate_traffic \\
     --project <gcp-project> --customers 1000 --duration 60
+
+  # To actually observe an inferred cart.abandoned + the alert, run the
+  # pipeline with a short CART_ABANDONMENT_TIMEOUT_SECS (see pipeline.py)
+  # and pass a matching --abandon-quiet-secs here, comfortably longer than
+  # the pipeline's timeout so the stall genuinely outlasts it:
+  #   CART_ABANDONMENT_TIMEOUT_SECS=20 python -m examples.retail_orders.pipeline ...
+  #   python -m examples.retail_orders.simulate_traffic --abandon-quiet-secs 30 ...
 """
 
 from __future__ import annotations
@@ -50,7 +63,7 @@ P_REFUND_AFTER_PURCHASE = 0.10
 @dataclass
 class Shopper:
     customer_id: str
-    state: str = "IDLE"  # IDLE | IN_CART | DONE
+    state: str = "IDLE"  # IDLE | IN_CART | STALLED | DONE
     channel: str = ""
     region: str = ""
     cart_items: int = 0
@@ -77,8 +90,10 @@ def _envelope(event_type: str, shopper: Shopper, order_total: float) -> dict:
     }
 
 
-def step(shopper: Shopper, min_interval: float, max_interval: float) -> dict | None:
-    """Advances one shopper by one action and returns the event to publish."""
+def step(shopper: Shopper, min_interval: float, max_interval: float, abandon_quiet_secs: float) -> dict | None:
+    """Advances one shopper by one action and returns the event to publish,
+    or None if this tick doesn't produce one (going quiet, or coming back
+    from being quiet)."""
     event = None
 
     if shopper.state == "IDLE":
@@ -102,12 +117,22 @@ def step(shopper: Shopper, min_interval: float, max_interval: float) -> dict | N
             shopper.cart_value = max(0.0, shopper.cart_value - item_value)
             event = _envelope("cart.item_removed", shopper, 0.0)
         elif roll < P_ADD_ITEM + P_REMOVE_ITEM + P_ABANDON:
-            event = _envelope("cart.abandoned", shopper, 0.0)
-            shopper.state = "IDLE"
+            # Real abandonment: stop acting and let the pipeline's
+            # CART_INACTIVITY_DETECTOR infer it from the silence — no event
+            # published here at all.
+            shopper.state = "STALLED"
+            shopper.next_action_at = time.monotonic() + abandon_quiet_secs
+            return None
         else:
             shopper.order_total = shopper.cart_value
             event = _envelope("order.created", shopper, shopper.order_total)
             shopper.state = "DONE"
+
+    elif shopper.state == "STALLED":
+        # Quiet period is over; start a new session on the next tick.
+        shopper.state = "IDLE"
+        shopper.cart_items = 0
+        shopper.cart_value = 0.0
 
     elif shopper.state == "DONE":
         roll = random.random()
@@ -129,6 +154,12 @@ def main():
     parser.add_argument("--duration", type=int, default=60, help="seconds")
     parser.add_argument("--min-interval", type=float, default=1.0, help="min seconds between one shopper's actions")
     parser.add_argument("--max-interval", type=float, default=3.0, help="max seconds between one shopper's actions")
+    parser.add_argument(
+        "--abandon-quiet-secs", type=float, default=1500,
+        help="how long a shopper who abandons their cart stays silent before starting a new session "
+             "(default 1500s = 25min, comfortably longer than the pipeline's real 20min timeout; "
+             "pass something shorter than a shortened CART_ABANDONMENT_TIMEOUT_SECS to actually see it fire in a test run)",
+    )
     args = parser.parse_args()
 
     publisher = pubsub_v1.PublisherClient()
@@ -158,7 +189,7 @@ def main():
         for shopper in shoppers:
             if shopper.next_action_at > now:
                 continue
-            event = step(shopper, args.min_interval, args.max_interval)
+            event = step(shopper, args.min_interval, args.max_interval, args.abandon_quiet_secs)
             if event is None:
                 continue
             future = publisher.publish(topic_path, json.dumps(event).encode("utf-8"))
