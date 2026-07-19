@@ -1,6 +1,7 @@
 # Dataset/table names below must match ORDERS_DOMAIN's raw_table/dlq_table/
-# enriched_table in examples/retail_orders/pipeline.py, and the alerts_table
-# passed to cli_main() there ("raw.alerts").
+# enriched_table and CUSTOMER_360_DOMAIN's enriched_table in
+# examples/retail_orders/pipeline.py, and the alerts_table passed to
+# cli_main() there ("raw.alerts").
 #
 # Tables are pre-created with explicit schemas rather than relying on
 # WriteToBigQuery's CREATE_IF_NEEDED + autodetect: BigQuery's Storage Write
@@ -59,6 +60,7 @@ resource "google_bigquery_table" "order_events" {
         { name = "channel", type = "STRING", mode = "REQUIRED" },
         { name = "region", type = "STRING", mode = "REQUIRED" },
         { name = "order_total", type = "FLOAT64", mode = "REQUIRED" },
+        { name = "customer_id", type = "STRING", mode = "REQUIRED" },
       ]
     },
     { name = "ingested_at", type = "TIMESTAMP", mode = "REQUIRED" },
@@ -120,6 +122,36 @@ resource "google_bigquery_table" "order_summary_5min" {
     { name = "computed_at", type = "TIMESTAMP", mode = "REQUIRED" },
     { name = "channel", type = "STRING", mode = "REQUIRED" },
     { name = "region", type = "STRING", mode = "REQUIRED" },
+    { name = "window_start", type = "TIMESTAMP", mode = "REQUIRED" },
+    { name = "window_end", type = "TIMESTAMP", mode = "REQUIRED" },
+  ])
+}
+
+# enriched.customer_360 — one row per customer_id per 5-minute window,
+# written by CUSTOMER_360_DOMAIN — a second aggregation over the same
+# raw.order_events stream, keyed differently. See CUSTOMER_360_DOMAIN's
+# comment in pipeline.py for why it has no raw_table/dlq_table of its own.
+resource "google_bigquery_table" "customer_360" {
+  dataset_id          = google_bigquery_dataset.enriched.dataset_id
+  table_id            = "customer_360"
+  project             = var.project_id
+  labels              = var.labels
+  deletion_protection = false
+
+  schema = jsonencode([
+    { name = "customer_id", type = "STRING", mode = "REQUIRED" },
+    { name = "event_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "cart_added_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "cart_removed_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "cart_abandoned_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "created_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "total_spend", type = "FLOAT64", mode = "REQUIRED" },
+    { name = "cancelled_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "refunded_count", type = "INTEGER", mode = "REQUIRED" },
+    { name = "refunded_amount", type = "FLOAT64", mode = "REQUIRED" },
+    { name = "last_channel", type = "STRING", mode = "NULLABLE" },
+    { name = "last_region", type = "STRING", mode = "NULLABLE" },
+    { name = "computed_at", type = "TIMESTAMP", mode = "REQUIRED" },
     { name = "window_start", type = "TIMESTAMP", mode = "REQUIRED" },
     { name = "window_end", type = "TIMESTAMP", mode = "REQUIRED" },
   ])

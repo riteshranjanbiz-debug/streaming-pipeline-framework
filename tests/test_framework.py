@@ -120,6 +120,18 @@ class TestValidateEvent:
         assert tagged[0].tag == "dlq"
         assert "payload is not an object" in tagged[0].value["_error"]
 
+    def test_enforce_domain_match_false_skips_mismatch_check(self):
+        # A second DomainSpec consuming the same event stream for a
+        # different aggregation necessarily has a different .name than the
+        # events' own "domain" field — enforce_domain_match=False is how it
+        # opts out of the mismatch check without disabling validation
+        # entirely.
+        validator = ValidateEvent(
+            "widgets_360", ENVELOPE_REQUIRED, PAYLOAD_REQUIRED, enforce_domain_match=False,
+        )
+        result = collect(validator, _widget_event())  # event's domain is "widgets", not "widgets_360"
+        assert len(result) == 1
+
 
 # ── EnrichEvent ────────────────────────────────────────────────────────────────
 
@@ -331,6 +343,22 @@ class TestDomainSpec:
     def test_minimal_spec_is_valid(self):
         spec = DomainSpec(name="widgets", topic="widget-events", raw_table="raw.widgets")
         assert spec.enriched_table is None
+
+    def test_requires_raw_table_or_enriched_table(self):
+        with pytest.raises(ValueError, match="must set at least one of"):
+            DomainSpec(name="widgets", topic="widget-events")
+
+    def test_raw_table_omitted_with_aggregation_is_valid(self):
+        # An aggregation-only domain deriving a second view from an event
+        # stream another DomainSpec already writes raw (e.g. customer-360).
+        spec = DomainSpec(
+            name="widgets_360", topic="widget-events",
+            enriched_table="enriched.widgets_360",
+            key_fn=lambda e: e["customer_id"],
+            aggregate_fn=lambda: object(),
+            enforce_domain_match=False,
+        )
+        assert spec.raw_table is None
 
     def test_full_aggregation_spec_is_valid(self):
         spec = DomainSpec(

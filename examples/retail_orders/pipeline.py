@@ -12,6 +12,18 @@ events, payload.order_id doubles as a cart/session identifier and
 payload.order_total as the cart's value at that point (0 is fine for
 removal/abandonment events that don't carry a meaningful total).
 
+Two DomainSpecs consume the same "order-events" topic: ORDERS_DOMAIN (the
+operational (channel, region) view above) and CUSTOMER_360_DOMAIN (a
+per-customer view keyed by payload.customer_id). This is the framework's
+pattern for multiple derived views over one event stream — see
+DomainSpec.raw_table and .enforce_domain_match's docstrings in framework.py
+for why CUSTOMER_360_DOMAIN sets raw_table=None and
+enforce_domain_match=False. Note "360" here means "everything about this
+customer within the current 5-minute window," not an unbounded lifetime
+profile — this framework's aggregation is fundamentally windowed; a true
+lifetime CDP-style profile needs a keyed store (Bigtable, Firestore) or a
+periodic BigQuery MERGE, not FixedWindows.
+
 Run locally (DirectRunner, needs real Pub/Sub + BigQuery):
   python -m examples.retail_orders.pipeline --project <gcp-project> --runner DirectRunner
 
@@ -34,7 +46,7 @@ from streaming_pipeline_framework.cli import main as cli_main
 ENVELOPE_REQUIRED = frozenset(
     {"event_id", "event_type", "source_system", "domain", "public_id", "timestamp"}
 )
-PAYLOAD_REQUIRED = frozenset({"order_id", "channel", "region", "order_total"})
+PAYLOAD_REQUIRED = frozenset({"order_id", "channel", "region", "order_total", "customer_id"})
 
 CANCELLATION_RATE_THRESHOLD = 0.15
 REFUND_SPIKE_THRESHOLD = 5_000.0
@@ -61,6 +73,7 @@ ORDER_EVENTS_SCHEMA = {
                 {"name": "channel", "type": "STRING", "mode": "REQUIRED"},
                 {"name": "region", "type": "STRING", "mode": "REQUIRED"},
                 {"name": "order_total", "type": "FLOAT", "mode": "REQUIRED"},
+                {"name": "customer_id", "type": "STRING", "mode": "REQUIRED"},
             ],
         },
         {"name": "ingested_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
@@ -81,6 +94,31 @@ ORDER_SUMMARY_SCHEMA = {
         {"name": "computed_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
         {"name": "channel", "type": "STRING", "mode": "REQUIRED"},
         {"name": "region", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "window_start", "type": "TIMESTAMP", "mode": "REQUIRED"},
+        {"name": "window_end", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    ]
+}
+
+# enriched.customer_360 — one row per customer_id per 5-minute window,
+# written by CUSTOMER_360_DOMAIN. last_channel/last_region are best-effort:
+# a CombineFn's accumulators can merge in any order across a distributed
+# combine, so "last" means "an arbitrary event observed in this window,"
+# not a true chronologically-last one.
+CUSTOMER_360_SCHEMA = {
+    "fields": [
+        {"name": "customer_id", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "event_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "cart_added_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "cart_removed_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "cart_abandoned_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "created_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "total_spend", "type": "FLOAT", "mode": "REQUIRED"},
+        {"name": "cancelled_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "refunded_count", "type": "INTEGER", "mode": "REQUIRED"},
+        {"name": "refunded_amount", "type": "FLOAT", "mode": "REQUIRED"},
+        {"name": "last_channel", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "last_region", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "computed_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
         {"name": "window_start", "type": "TIMESTAMP", "mode": "REQUIRED"},
         {"name": "window_end", "type": "TIMESTAMP", "mode": "REQUIRED"},
     ]
@@ -180,6 +218,70 @@ class AggregateOrderWindow(beam.CombineFn):
         return {**accumulator, "computed_at": datetime.now(timezone.utc).isoformat()}
 
 
+def customer_key(event: dict) -> tuple:
+    payload = event.get("payload") or {}
+    return (payload.get("customer_id", "unknown"),)
+
+
+class AggregateCustomer360(beam.CombineFn):
+    """Key: (customer_id,) — reattached by the framework, same as
+    AggregateOrderWindow. See CUSTOMER_360_DOMAIN below and the module
+    docstring for why this is a second CombineFn over the same event stream
+    ORDERS_DOMAIN already aggregates by (channel, region)."""
+
+    def create_accumulator(self):
+        return {
+            "event_count": 0,
+            "cart_added_count": 0,
+            "cart_removed_count": 0,
+            "cart_abandoned_count": 0,
+            "created_count": 0,
+            "total_spend": 0.0,
+            "cancelled_count": 0,
+            "refunded_count": 0,
+            "refunded_amount": 0.0,
+            "last_channel": None,
+            "last_region": None,
+        }
+
+    def add_input(self, accumulator, event):
+        event_type = event.get("event_type")
+        payload = event.get("payload") or {}
+        order_total = payload.get("order_total") or 0
+        accumulator["event_count"] += 1
+        accumulator["last_channel"] = payload.get("channel")
+        accumulator["last_region"] = payload.get("region")
+        if event_type == "cart.item_added":
+            accumulator["cart_added_count"] += 1
+        elif event_type == "cart.item_removed":
+            accumulator["cart_removed_count"] += 1
+        elif event_type == "cart.abandoned":
+            accumulator["cart_abandoned_count"] += 1
+        elif event_type == "order.created":
+            accumulator["created_count"] += 1
+            accumulator["total_spend"] += order_total
+        elif event_type == "order.cancelled":
+            accumulator["cancelled_count"] += 1
+        elif event_type == "order.refunded":
+            accumulator["refunded_count"] += 1
+            accumulator["refunded_amount"] += order_total
+            accumulator["total_spend"] -= order_total
+        return accumulator
+
+    def merge_accumulators(self, accumulators):
+        merged = self.create_accumulator()
+        for acc in accumulators:
+            for key in merged:
+                if key in ("last_channel", "last_region"):
+                    merged[key] = acc[key] or merged[key]
+                else:
+                    merged[key] += acc[key]
+        return merged
+
+    def extract_output(self, accumulator):
+        return {**accumulator, "computed_at": datetime.now(timezone.utc).isoformat()}
+
+
 def _alert(alert_type: str, severity: str, agg: dict[str, Any],
            metric_name: str, metric_value: float, threshold: float) -> dict[str, Any]:
     return {
@@ -249,6 +351,27 @@ ORDERS_DOMAIN = DomainSpec(
     alert_evaluator=evaluate_order_alerts,
 )
 
+# Second view over the same "order-events" topic — see the module
+# docstring. raw_table is omitted (ORDERS_DOMAIN already persists every raw
+# event; writing it twice would be pure duplication) and
+# enforce_domain_match=False (the events' own "domain" field is "orders",
+# not "customer_360" — see DomainSpec.enforce_domain_match's docstring).
+# No dlq_table either: ORDERS_DOMAIN already captures DLQ for this same
+# event stream, so a second copy of every validation failure would just be
+# noise.
+CUSTOMER_360_DOMAIN = DomainSpec(
+    name="customer_360",
+    topic="order-events",
+    envelope_required=ENVELOPE_REQUIRED,
+    payload_required=PAYLOAD_REQUIRED,
+    enforce_domain_match=False,
+    enriched_table="enriched.customer_360",
+    enriched_table_schema=CUSTOMER_360_SCHEMA,
+    key_fn=customer_key,
+    aggregate_fn=AggregateCustomer360,
+    key_field_names=("customer_id",),
+)
+
 
 def _build_incident_notifier():
     """
@@ -270,7 +393,7 @@ def _build_incident_notifier():
 
 if __name__ == "__main__":
     cli_main(
-        [ORDERS_DOMAIN],
+        [ORDERS_DOMAIN, CUSTOMER_360_DOMAIN],
         alerts_table="raw.alerts",
         alerts_table_schema=ALERTS_SCHEMA,
         description="Retail order events pipeline (streaming-pipeline-framework example)",

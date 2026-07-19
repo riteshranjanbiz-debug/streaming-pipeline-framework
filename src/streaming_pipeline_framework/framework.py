@@ -114,12 +114,35 @@ class DomainSpec:
                          alert `domain` tag (e.g. "orders", "shipments")
       topic              Pub/Sub topic name (short form, not the full path —
                          the project is supplied separately at build time)
+
+    Optional:
       raw_table          "dataset.table" the parsed/validated/enriched event
-                         is written to, one row per event
+                         is written to, one row per event. Omit for an
+                         aggregation-only domain that derives a second view
+                         from an event stream another `DomainSpec` already
+                         writes raw (e.g. a customer-360 aggregate built
+                         from the same events an "orders" domain already
+                         persists) — skips the raw-write branch entirely
+                         rather than duplicating every row into two tables.
+                         See `enforce_domain_match` below for the other
+                         half of that pattern.
 
     Validation (both optional — omit to skip validation entirely):
       envelope_required   field names every event's top level must have
       payload_required    field names required inside `event["payload"]`
+      enforce_domain_match  default True: an event whose top-level `domain`
+                           field doesn't match this DomainSpec's `name` is
+                           treated as misrouted and sent to DLQ — a cheap
+                           safety net for topic mixups. Set False when
+                           deliberately running a second `DomainSpec` over
+                           the *same* topic/event stream for a different
+                           aggregation (e.g. an operational view and a
+                           separate customer-360 view built from the same
+                           events) — those specs necessarily have different
+                           `name`s (Beam step labels must be unique per
+                           pipeline) but the events' own `domain` field is
+                           still the shared stream's single value, so the
+                           mismatch check would otherwise reject everything.
 
     Windowed aggregation (all three required together, or all omitted):
       enriched_table      "dataset.table" for the windowed aggregate rows
@@ -213,9 +236,10 @@ class DomainSpec:
 
     name: str
     topic: str
-    raw_table: str
+    raw_table: Optional[str] = None
     envelope_required: frozenset[str] = field(default_factory=frozenset)
     payload_required: frozenset[str] = field(default_factory=frozenset)
+    enforce_domain_match: bool = True
     enriched_table: Optional[str] = None
     key_fn: Optional[Callable[[dict], Any]] = None
     aggregate_fn: Optional[Callable[[], Any]] = None
@@ -231,6 +255,12 @@ class DomainSpec:
     enriched_table_schema: Optional[dict] = None
 
     def __post_init__(self):
+        if self.raw_table is None and self.enriched_table is None:
+            raise ValueError(
+                f"DomainSpec {self.name!r}: must set at least one of "
+                "raw_table or enriched_table — a domain that writes nothing "
+                "isn't doing anything"
+            )
         has_agg = (self.enriched_table, self.key_fn, self.aggregate_fn)
         if any(has_agg) and not all(has_agg):
             raise ValueError(
@@ -327,10 +357,12 @@ class ValidateEvent(beam.DoFn):
         domain: str,
         envelope_required: Iterable[str] = (),
         payload_required: Iterable[str] = (),
+        enforce_domain_match: bool = True,
     ):
         self.domain = domain
         self.envelope_required = frozenset(envelope_required)
         self.payload_required = frozenset(payload_required)
+        self.enforce_domain_match = enforce_domain_match
 
     def process(self, event, *args, **kwargs):
         missing = self.envelope_required - event.keys()
@@ -340,7 +372,7 @@ class ValidateEvent(beam.DoFn):
             return
 
         event_domain = event.get("domain")
-        if event_domain is not None and event_domain != self.domain:
+        if self.enforce_domain_match and event_domain is not None and event_domain != self.domain:
             Metrics.counter(_ns(self.domain), "validate_failures").inc()
             yield beam.pvalue.TaggedOutput("dlq", _dlq(
                 self.domain, f"domain mismatch: expected {self.domain!r}, got {event_domain!r}", event
@@ -668,7 +700,7 @@ def build_streaming_pipeline(
 
     if write_method == "STORAGE_WRITE_API":
         for spec in domains:
-            if not spec.raw_table_schema:
+            if spec.raw_table and not spec.raw_table_schema:
                 raise ValueError(
                     f"DomainSpec {spec.name!r}: raw_table_schema is required "
                     "when write_method='STORAGE_WRITE_API' (see DomainSpec's "
@@ -729,17 +761,18 @@ def build_streaming_pipeline(
                 )
 
             valid = to_validate | f"{spec.name}_Validate" >> beam.ParDo(
-                ValidateEvent(spec.name, spec.envelope_required, spec.payload_required)
+                ValidateEvent(spec.name, spec.envelope_required, spec.payload_required, spec.enforce_domain_match)
             ).with_outputs("dlq", main="ok")
             enriched = valid.ok | f"{spec.name}_Enrich" >> beam.ParDo(
                 EnrichEvent(pipeline_version, spec.name)
             ).with_outputs("dlq", main="ok")
-            clean = enriched.ok | f"{spec.name}_Strip" >> beam.ParDo(StripInternalFields())
 
-            _write_bigquery(
-                clean, f"{spec.name}_WriteRaw", f"{project}:{spec.raw_table}",
-                spec.raw_table_schema, write_method, write_cfg,
-            )
+            if spec.raw_table:
+                clean = enriched.ok | f"{spec.name}_Strip" >> beam.ParDo(StripInternalFields())
+                _write_bigquery(
+                    clean, f"{spec.name}_WriteRaw", f"{project}:{spec.raw_table}",
+                    spec.raw_table_schema, write_method, write_cfg,
+                )
 
             keyed = None
             agg = None
