@@ -13,7 +13,11 @@ dependencies = []
 [project.optional-dependencies]
 gcp = ["apache-beam[gcp]>=2.56.0"]
 servicenow = ["requests>=2.31"]
+sfmc = ["requests>=2.31"]
 dev = ["pytest>=8.0", "requests>=2.31", "responses>=0.25"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -16,9 +16,11 @@ from .health import (
     run_with_incident_on_failure,
 )
 
-# Note: servicenow.ServiceNowClient is deliberately NOT re-exported here —
-# it requires `requests` (the `servicenow` extra). Import it directly:
+# Note: servicenow.ServiceNowClient and sfmc.SFMCClient are deliberately NOT
+# re-exported here — both require `requests` (the `servicenow`/`sfmc`
+# extras). Import them directly:
 #   from streaming_pipeline_framework.servicenow import ServiceNowClient
+#   from streaming_pipeline_framework.sfmc import SFMCClient
 # so importing this package's core stays dependency-free.
 
 __all__ = [
