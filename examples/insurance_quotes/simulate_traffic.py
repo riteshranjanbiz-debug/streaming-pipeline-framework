@@ -1,6 +1,6 @@
 """
 Simulates N concurrent insurance applicants, each a persistent mdmId moving
-through the EDSP quote funnel over time — not independent random events:
+through the QuoteFlow quote funnel over time — not independent random events:
 
   NEW -> pre-quote:initiated -> PRE_QUOTE (person-add, address-add, confirmed)
   PRE_QUOTE -> quote:quoted -> QUOTED
@@ -8,7 +8,7 @@ through the EDSP quote funnel over time — not independent random events:
   PAYMENT -> post-quote:bind -> BOUND
   (any of PRE_QUOTE / QUOTED / PAYMENT) -> stop acting -> STALLED
 
-Deliberately does NOT publish a "quote:abandoned" event — no real EDSP
+Deliberately does NOT publish a "quote:abandoned" event — no real QuoteFlow
 integration ever fires one. An applicant who "abandons" just stops acting
 (STALLED, no event) for a while; the pipeline's QUOTE_INACTIVITY_DETECTOR
 is what infers abandonment from that silence and classifies which scenario
@@ -24,15 +24,15 @@ Needs google-cloud-pubsub, already pulled in by the `gcp` extra
 pipeline itself requires.
 
 Usage:
-  python -m examples.edsp_quotes.simulate_traffic \\
+  python -m examples.insurance_quotes.simulate_traffic \\
     --project <gcp-project> --applicants 1000 --duration 60
 
   # To actually observe an inferred quote:abandoned + the SFMC trigger,
   # run the pipeline with a short QUOTE_ABANDONMENT_TIMEOUT_SECS (see
   # pipeline.py) and pass a matching --abandon-quiet-secs here, comfortably
   # longer than the pipeline's timeout:
-  #   QUOTE_ABANDONMENT_TIMEOUT_SECS=20 python -m examples.edsp_quotes.pipeline ...
-  #   python -m examples.edsp_quotes.simulate_traffic --abandon-quiet-secs 30 ...
+  #   QUOTE_ABANDONMENT_TIMEOUT_SECS=20 python -m examples.insurance_quotes.pipeline ...
+  #   python -m examples.insurance_quotes.simulate_traffic --abandon-quiet-secs 30 ...
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def _envelope(event_type: str, applicant: Applicant, extra_payload: dict | None 
     return {
         "event_id": str(uuid.uuid4()),
         "event_type": event_type,
-        "source_system": "edsp-simulator",
+        "source_system": "insurance-quote-simulator",
         "domain": "quotes",
         "public_id": f"PUB-{uuid.uuid4().hex[:8]}",
         "timestamp": datetime.now(timezone.utc).isoformat(),

@@ -1,12 +1,12 @@
 """
-Unit tests for examples/edsp_quotes/pipeline.py's abandonment-inference
+Unit tests for examples/insurance_quotes/pipeline.py's abandonment-inference
 logic — the reducer, pending check, and scenario classification are the
 one piece of real business logic in this example worth dedicated coverage
 (the two CombineFns and DomainSpecs follow the same pattern already
 covered by tests/test_framework.py and retail_orders' CI sanity check).
 """
 
-from examples.edsp_quotes.pipeline import (
+from examples.insurance_quotes.pipeline import (
     PAYLOAD_REQUIRED,
     _quote_state_reducer,
     _quote_is_pending,

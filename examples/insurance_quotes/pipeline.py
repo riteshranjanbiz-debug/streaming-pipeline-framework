@@ -1,5 +1,5 @@
 """
-Example: EDSP insurance quote-application funnel on the
+Example: QuoteFlow insurance quote-application funnel on the
 streaming-pipeline-framework, with cart-style abandonment inferred from
 inactivity — reusing exactly the pattern built for examples/retail_orders/
 (see InactivityDetector in framework.py), applied to a real insurance
@@ -41,10 +41,10 @@ per-customer view keyed by mdmId). See DomainSpec.raw_table and
 APPLICANT_360_DOMAIN sets raw_table=None and enforce_domain_match=False.
 
 Run locally (DirectRunner, needs real Pub/Sub + BigQuery):
-  python -m examples.edsp_quotes.pipeline --project <gcp-project> --runner DirectRunner
+  python -m examples.insurance_quotes.pipeline --project <gcp-project> --runner DirectRunner
 
 Deploy to Dataflow:
-  python -m examples.edsp_quotes.pipeline \\
+  python -m examples.insurance_quotes.pipeline \\
     --project <gcp-project> --region us-central1 --runner DataflowRunner \\
     --temp-location gs://<bucket>/tmp \\
     --service-account-email <dataflow-sa>@<gcp-project>.iam.gserviceaccount.com
@@ -507,6 +507,6 @@ if __name__ == "__main__":
         [QUOTES_DOMAIN, APPLICANT_360_DOMAIN],
         alerts_table="raw.alerts",
         alerts_table_schema=ALERTS_SCHEMA,
-        description="EDSP quote abandonment pipeline (streaming-pipeline-framework example)",
+        description="QuoteFlow quote abandonment pipeline (streaming-pipeline-framework example)",
         incident_notifier=_build_incident_notifier(),
     )

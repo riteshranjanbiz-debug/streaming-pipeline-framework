@@ -1,6 +1,6 @@
-# EDSP Abandoned Quote Recovery — Use Case Documentation
+# QuoteFlow Abandoned Quote Recovery — Use Case Documentation
 
-**System:** EDSP (insurance sales platform)
+**System:** QuoteFlow (insurance sales platform)
 **Use case:** Detect abandoned insurance applications (property / auto / bundled) and automatically recover them via a stage-aware, multi-touch email nurture campaign in Salesforce Marketing Cloud.
 **Scope note:** The UI and event instrumentation described below already exist. This document covers the marketing automation capability that consumes those events — detection, segmentation, journey orchestration, and governance.
 
@@ -52,48 +52,48 @@ Classification is by **furthest stage reached**, not just the most recent event:
 ```mermaid
 sequenceDiagram
     actor CustomerAgent as Customer / Agent
-    participant EDSP as EDSP (Sales Platform)
+    participant Platform as QuoteFlow (Sales Platform)
     participant Events as Quote Journey Events<br/>(sessionId, traceId, quoteId)
     participant Nurture as Abandonment & Nurture Engine
     participant SFMC as SFMC (Email)
 
-    CustomerAgent->>EDSP: Open EDSP, land on landing page
-    CustomerAgent->>EDSP: Select product (property | auto | bundled)
-    EDSP->>Events: publish pre-quote:initiated
-    Events-->>EDSP: quoteId issued
+    CustomerAgent->>Platform: Open QuoteFlow, land on landing page
+    CustomerAgent->>Platform: Select product (property | auto | bundled)
+    Platform->>Events: publish pre-quote:initiated
+    Events-->>Platform: quoteId issued
     Note over Events: quoteId is the join key for every<br/>event in this customer's journey (mdmId identifies the customer)
 
-    CustomerAgent->>EDSP: Enter personal details (name, email, ...)
-    EDSP->>Events: publish pre-quote:person-add
+    CustomerAgent->>Platform: Enter personal details (name, email, ...)
+    Platform->>Events: publish pre-quote:person-add
     opt Customer edits personal details
-        CustomerAgent->>EDSP: Update personal details
-        EDSP->>Events: publish pre-quote:person-update
+        CustomerAgent->>Platform: Update personal details
+        Platform->>Events: publish pre-quote:person-update
     end
 
-    CustomerAgent->>EDSP: Enter address
-    EDSP->>Events: publish pre-quote:address-add
+    CustomerAgent->>Platform: Enter address
+    Platform->>Events: publish pre-quote:address-add
     opt Customer edits or removes address
-        CustomerAgent->>EDSP: Update address
-        EDSP->>Events: publish pre-quote:address-update
-        CustomerAgent->>EDSP: Delete address
-        EDSP->>Events: publish pre-quote:address-delete
+        CustomerAgent->>Platform: Update address
+        Platform->>Events: publish pre-quote:address-update
+        CustomerAgent->>Platform: Delete address
+        Platform->>Events: publish pre-quote:address-delete
     end
 
-    CustomerAgent->>EDSP: Confirm personal & address details
-    Note over EDSP: Personal & address info now locked - cannot be edited further
+    CustomerAgent->>Platform: Confirm personal & address details
+    Note over Platform: Personal & address info now locked - cannot be edited further
 
     alt Scenario 1 - drops before a quote exists
-        CustomerAgent--xEDSP: Abandons (no further activity)
+        CustomerAgent--xPlatform: Abandons (no further activity)
     else Scenario 2 - quote generated, drops on coverage
-        EDSP->>Events: publish quote:quoted (premium + coverage returned)
+        Platform->>Events: publish quote:quoted (premium + coverage returned)
         opt Customer adjusts coverage
-            CustomerAgent->>EDSP: Change coverage options
-            EDSP->>Events: publish quote:recalculate
+            CustomerAgent->>Platform: Change coverage options
+            Platform->>Events: publish quote:recalculate
         end
-        CustomerAgent--xEDSP: Abandons (no further activity)
+        CustomerAgent--xPlatform: Abandons (no further activity)
     else Scenario 3 - drops on payment page
-        CustomerAgent->>EDSP: Proceed to payment options
-        CustomerAgent--xEDSP: Abandons (no further activity)
+        CustomerAgent->>Platform: Proceed to payment options
+        CustomerAgent--xPlatform: Abandons (no further activity)
     end
 
     Events->>Nurture: event stream (keyed by quoteId / mdmId)
@@ -117,7 +117,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     actor CustomerAgent as Customer / Agent
-    participant EDSP as EDSP (Sales Platform)
+    participant Platform as QuoteFlow (Sales Platform)
     participant Events as Quote Journey Events
     participant Nurture as Abandonment & Nurture Engine
     participant SFMC as SFMC (Email)
@@ -128,11 +128,11 @@ sequenceDiagram
     Nurture->>Nurture: schedule Day 1/2/3/14/30 - Scenario 2 cadence
 
     Note over CustomerAgent: Day 3 - customer clicks retrieval link
-    CustomerAgent->>EDSP: Retrieve quote via emailed link
-    EDSP->>Events: publish quote-retrieved / resume session
-    CustomerAgent->>EDSP: Proceed to payment options
-    Note over EDSP: Customer has now progressed past Scenario 2 into Scenario 3 territory
-    CustomerAgent--xEDSP: Abandons again (no further activity)
+    CustomerAgent->>Platform: Retrieve quote via emailed link
+    Platform->>Events: publish quote-retrieved / resume session
+    CustomerAgent->>Platform: Proceed to payment options
+    Note over Platform: Customer has now progressed past Scenario 2 into Scenario 3 territory
+    CustomerAgent--xPlatform: Abandons again (no further activity)
 
     Events->>Nurture: event stream shows progression to payment stage
     Nurture->>Nurture: re-evaluate furthest stage reached for this quoteId
@@ -150,7 +150,7 @@ sequenceDiagram
 
 ## 4. Capability: Abandoned Quote Recovery — Lifecycle Marketing Automation
 
-**Capability statement:** As EDSP Marketing, we want to automatically recover revenue from customers who start but don't finish an insurance application — by detecting abandonment in real time, segmenting by purchase intent, and running a personalized multi-touch journey that stops the instant they convert — so we lift bind rate without adding manual outreach load on sales or agents.
+**Capability statement:** As QuoteFlow Marketing, we want to automatically recover revenue from customers who start but don't finish an insurance application — by detecting abandonment in real time, segmenting by purchase intent, and running a personalized multi-touch journey that stops the instant they convert — so we lift bind rate without adding manual outreach load on sales or agents.
 
 **KPIs this capability should move:**
 - **Abandonment recovery rate** — % of abandoned quotes that bind after entering the journey (north star)
@@ -264,7 +264,7 @@ sequenceDiagram
 
 ## 6. Reference Implementation
 
-`examples/edsp_quotes/` implements the detection + classification + Day-0 trigger slice of this
+`examples/insurance_quotes/` implements the detection + classification + Day-0 trigger slice of this
 capability (Features 1, 2, 6, and a stateless slice of 3) on top of this repo's generic
 streaming-pipeline-framework — see that directory's `pipeline.py` module docstring for the
 event/payload shapes and scenario-classification logic, and `simulate_traffic.py` for a synthetic

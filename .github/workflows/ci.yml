@@ -39,4 +39,4 @@ jobs:
       - run: python -c "import streaming_pipeline_framework as f; assert f.framework.BEAM_AVAILABLE is True"
       - run: pytest -v
       - run: python -c "from examples.retail_orders.pipeline import AggregateOrderWindow, AggregateCustomer360; AggregateOrderWindow(); AggregateCustomer360()"
-      - run: python -c "from examples.edsp_quotes.pipeline import AggregateQuoteFunnel, AggregateApplicant360; AggregateQuoteFunnel(); AggregateApplicant360()"
+      - run: python -c "from examples.insurance_quotes.pipeline import AggregateQuoteFunnel, AggregateApplicant360; AggregateQuoteFunnel(); AggregateApplicant360()"
