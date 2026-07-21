@@ -118,6 +118,21 @@ Thin argparse wrapper (`--project/--region/--runner/--temp-location
 `DomainSpec` list — see `examples/retail_orders/pipeline.py` for the full pattern. Wires
 `build_streaming_pipeline` inside `run_with_incident_on_failure`.
 
+`main()` also runs `_check_dataflow_worker_packaging` right after arg parsing: with
+`--runner DataflowRunner`, `save_main_session=True` (set unconditionally) stages only
+`__main__`'s state, never the `streaming_pipeline_framework` package itself — without
+`--extra_package`/`--setup_file`/`--sdk_location`/`--sdk_container_image`, every worker
+bundle fails with `ModuleNotFoundError` and the job sits at `RUNNING` with zero throughput
+and no obvious error (confirmed live: took several debugging rounds to trace). This check
+fails fast at submission instead. The fix in practice: `pip wheel . -w dist/ --no-deps`,
+then pass `--extra_package dist/streaming_pipeline_framework-*.whl` — see either example's
+"Deploy to Dataflow" docstring.
+
+Separately, `STORAGE_WRITE_API` (the default write method) is a cross-language transform —
+even submitting to `DataflowRunner` from a laptop requires a real local JRE to run Beam's
+expansion service before staging. macOS ships a `java` stub that only prompts you to install
+one; `brew install openjdk` (and putting it on `PATH`) is one way to get a real one.
+
 ## Testing conventions
 
 - `tests/test_framework.py` uses a synthetic "widget" domain (not insurance or retail)

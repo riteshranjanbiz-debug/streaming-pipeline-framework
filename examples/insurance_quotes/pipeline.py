@@ -44,10 +44,18 @@ Run locally (DirectRunner, needs real Pub/Sub + BigQuery):
   python -m examples.insurance_quotes.pipeline --project <gcp-project> --runner DirectRunner
 
 Deploy to Dataflow:
+  # Workers run in a fresh container that only has apache-beam installed —
+  # this package itself has to be staged explicitly (save_main_session
+  # does NOT cover it, only __main__'s state). Skipping this makes the job
+  # sit at RUNNING with zero throughput and no obvious error; cli.py's
+  # _check_dataflow_worker_packaging fails fast at submission instead of
+  # letting that happen silently.
+  pip wheel . -w dist/ --no-deps
   python -m examples.insurance_quotes.pipeline \\
     --project <gcp-project> --region us-central1 --runner DataflowRunner \\
     --temp-location gs://<bucket>/tmp \\
-    --service-account-email <dataflow-sa>@<gcp-project>.iam.gserviceaccount.com
+    --service-account-email <dataflow-sa>@<gcp-project>.iam.gserviceaccount.com \\
+    --extra_package dist/streaming_pipeline_framework-*.whl
 """
 
 from __future__ import annotations
