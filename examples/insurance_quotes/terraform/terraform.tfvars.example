@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars and fill in, or pass -var on the command line.
+# terraform.tfvars itself is gitignored — don't commit real project IDs here.
+
+project_id = "my-gcp-project"
+
+# Optional overrides (defaults shown):
+# region                      = "us-central1"
+# bigquery_dataset_location   = "US"
+# dataflow_service_account_id = "streaming-pipeline-dataflow"

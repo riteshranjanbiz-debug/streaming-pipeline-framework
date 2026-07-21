@@ -505,7 +505,7 @@ def _build_incident_notifier():
 if __name__ == "__main__":
     cli_main(
         [QUOTES_DOMAIN, APPLICANT_360_DOMAIN],
-        alerts_table="raw.alerts",
+        alerts_table="raw.quote_alerts",
         alerts_table_schema=ALERTS_SCHEMA,
         description="QuoteFlow quote abandonment pipeline (streaming-pipeline-framework example)",
         incident_notifier=_build_incident_notifier(),
