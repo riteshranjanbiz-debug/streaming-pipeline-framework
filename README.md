@@ -68,6 +68,12 @@ orders = DomainSpec(
 raise `ValueError` immediately rather than failing confusingly at pipeline
 build time).
 
+New to Apache Beam, or want to understand what actually happens between
+Pub/Sub and BigQuery? [`docs/how-the-pipeline-works.md`](docs/how-the-pipeline-works.md)
+walks through every method in `framework.py` — what it does, when Beam calls
+it, and how `build_streaming_pipeline` wires them into the DAG — including a
+worked example tracing one event end-to-end.
+
 ## Quickstart
 
 ```python

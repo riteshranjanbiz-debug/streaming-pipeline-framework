@@ -21,6 +21,12 @@ alert evaluator), and `build_streaming_pipeline` wires the DAG for all of them.
 `examples/retail_orders/` is the reference implementation of a second domain, proving the
 framework doesn't secretly assume insurance-specific shape.
 
+For a method-by-method walkthrough of what every `DoFn`/`CombineFn` in `framework.py` does,
+when Beam calls it, and how it's all wired together — including the stateful
+`_InactivityWatcher` timer mechanism and the `CombineFn` aggregation lifecycle — see
+`docs/how-the-pipeline-works.md`. `docs/deploying-to-dataflow.md` covers the operational
+side (launching, verifying, tearing down a job on GCP).
+
 ## Commands
 
 ```bash
