@@ -126,7 +126,9 @@ bundle fails with `ModuleNotFoundError` and the job sits at `RUNNING` with zero 
 and no obvious error (confirmed live: took several debugging rounds to trace). This check
 fails fast at submission instead. The fix in practice: `pip wheel . -w dist/ --no-deps`,
 then pass `--extra_package dist/streaming_pipeline_framework-*.whl` — see either example's
-"Deploy to Dataflow" docstring.
+"Deploy to Dataflow" docstring, or `docs/deploying-to-dataflow.md` for the full
+no-prior-experience walkthrough (both this and the JRE point below, plus zone-capacity
+errors and how to verify/tear down a job).
 
 Separately, `STORAGE_WRITE_API` (the default write method) is a cross-language transform —
 even submitting to `DataflowRunner` from a laptop requires a real local JRE to run Beam's

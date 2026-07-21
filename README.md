@@ -138,6 +138,13 @@ cancel that first (`gcloud dataflow jobs cancel <job-id>` or the Dataflow
 console), since that's the actual compute cost driver, not the supporting
 infrastructure.
 
+New to Dataflow, or need to hand this off to someone who is?
+[`docs/deploying-to-dataflow.md`](docs/deploying-to-dataflow.md) is a
+no-prior-experience walkthrough of this whole flow — what each GCP service
+is for, how to launch and verify a job, and the exact errors you'll hit the
+first time (a missing local Java runtime, and a Dataflow-worker packaging
+gotcha) with plain-language fixes.
+
 ## Incident creation on pipeline failure
 
 Two independent, opt-in triggers, both in `health.py`, both accepting any
